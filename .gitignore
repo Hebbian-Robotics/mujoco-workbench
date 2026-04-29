@@ -1,0 +1,22 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local assistant/editor state
+.claude/
+
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+
+# Runtime artifacts
+*.log
+*.pid
+MUJOCO_LOG.TXT
+results/
