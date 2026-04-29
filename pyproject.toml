@@ -24,6 +24,20 @@ dependencies = [
     "viser>=1.0.26",
 ]
 
+[project.scripts]
+mujoco-workbench = "mujoco_workbench.cli:main"
+mwb = "mujoco_workbench.cli:main"
+
+[build-system]
+requires = [
+    "uv_build>=0.11.8", #
+]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["mujoco_workbench", "examples"]
+module-root = ""
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.152.4",
@@ -35,9 +49,8 @@ dev = [
 [tool.pytest.ini_options]
 # `tests/` is the only test root; explicit `testpaths` keeps pytest from
 # scanning scenes/ etc. for false-positive collections. `pythonpath = ["."]`
-# adds the project root to sys.path so tests can `import scene_base` etc.
-# the same way the runner does (project modules live at the top level, not in
-# a src/ layout).
+# adds the project root to sys.path so tests can import the package and bundled
+# examples without installing an editable wheel first.
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra --strict-markers --strict-config"

@@ -12,7 +12,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from scene_check import _aabb_overlap, _GeomBox, _point_in_aabb
+from mujoco_workbench.scene_check import _aabb_overlap, _GeomBox, _point_in_aabb
 
 
 def _box(min_xyz: tuple[float, float, float], max_xyz: tuple[float, float, float]) -> _GeomBox:

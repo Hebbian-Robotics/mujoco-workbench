@@ -28,8 +28,11 @@ _MENAGERIE = Path(os.environ.get("MENAGERIE_PATH") or (Path.home() / "mujoco_men
 if not (_MENAGERIE / "universal_robots_ur10e" / "ur10e.xml").is_file():
     pytest.skip(f"menagerie not found at {_MENAGERIE}", allow_module_level=True)
 
-from scene_base import PhaseContract, TaskPhase  # noqa: E402  (path-probe gate above)
-from scenes import mobile_aloha_ur10e_server_swap as live_scene  # noqa: E402
+from examples.scenes import mobile_aloha_ur10e_server_swap as live_scene  # noqa: E402
+from mujoco_workbench.scene_base import (  # noqa: E402  (path-probe gate above)
+    PhaseContract,
+    TaskPhase,
+)
 
 PHASE_CONTRACTS: tuple[PhaseContract, ...] = live_scene.PHASE_CONTRACTS
 

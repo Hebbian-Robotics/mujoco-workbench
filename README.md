@@ -1,60 +1,65 @@
 # mujoco-workbench
 
-MuJoCo robotics simulation workspace with Viser playback, Rerun observability,
-headless multi-camera video export, scripted bimanual tasks, phase contracts,
-and file-based debug tooling designed for agent-assisted development.
+MuJoCo robotics simulation workbench with Viser playback, Rerun observability,
+headless multi-camera video export, scripted task timelines, phase contracts,
+and file-based debug artifacts designed for agent-assisted development.
 
-The repo is intentionally runnable as a standalone project. Scene code lives in
-`scenes/`, robot loaders live in `robots/`, and the `tools/` commands make sim
-state inspectable through screenshots, camera grids, videos, Rerun recordings,
-phase artifacts, and visual diffs without manually watching a browser.
+The reusable code lives in `mujoco_workbench/`. The current robot demos live in
+`examples/`, so they remain available without making the package itself specific
+to one robot, rack, or task.
 
 For the code map, module boundaries, and scene contract, read
 `ARCHITECTURE.md`.
 
-## What Is Included
+## Install
 
-- `mobile_aloha_ur10e_server_swap`: Mobile ALOHA-style base with two UR10e arms
-  and Robotiq 2F-85 grippers performing a server swap.
-- `mobile_aloha_piper_indicator_check`: Mobile ALOHA-style base with two Piper
-  arms inspecting a rack indicator, including top and wrist camera views for
-  headless multi-camera video export.
-- `tiago_piper_server_cable_swap`: older TIAGo/Piper server-swap variant kept
-  as a reference scene.
-
-Scenes use the naming pattern `<base>_<arms>_<task>`. The runner and debug tools
-load scenes dynamically from `scenes.<name>`.
-
-## Quick Start
-
-Install `uv` if needed:
+Install dependencies:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 ```
 
-Clone MuJoCo Menagerie. The default lookup path is `~/mujoco_menagerie`; set
-`MENAGERIE_PATH` if you keep it elsewhere.
+Clone MuJoCo Menagerie for the included robot examples. The default lookup path
+is `~/mujoco_menagerie`; set `MENAGERIE_PATH` if you keep it elsewhere.
 
 ```bash
 git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git ~/mujoco_menagerie
 ```
 
-Install Python dependencies and start the default scene:
+Recommended: install the agent skills from this repository so coding agents
+learn the `mwb` workflow and avoid stale script paths.
 
 ```bash
-uv sync
-./serve.sh start
+npx skills add Hebbian-Robotics/mujoco-workbench --list
+npx skills add Hebbian-Robotics/mujoco-workbench --skill mujoco-workbench
+npx skills add Hebbian-Robotics/mujoco-workbench --skill mujoco-run-debug
+```
+
+Install all bundled skills:
+
+```bash
+npx skills add Hebbian-Robotics/mujoco-workbench --skill '*'
+```
+
+## Run A Scene
+
+Use the single package CLI:
+
+```bash
+uv run mwb run examples.scenes.mobile_aloha_piper_indicator_check
 open http://localhost:8080
 ```
 
-Run the runner directly when you want explicit options:
+`serve.sh` is only a small lifecycle wrapper around the same CLI:
 
 ```bash
-uv run python runner.py --scene mobile_aloha_ur10e_server_swap
+./serve.sh start
+./serve.sh status
+./serve.sh logs 80
+./serve.sh stop
 ```
 
-Useful runner flags:
+Useful `mwb run` flags:
 
 - `--host`, `--port`: Viser bind address. Defaults to `127.0.0.1:8080`.
 - `--speed`: multiplier on scripted step durations.
@@ -66,53 +71,78 @@ Useful runner flags:
 - `--start-phase PHASE`: boot from a scene-defined phase home.
 - `--rerun-port`, `--rerun-connect`, `--rerun-rrd`: stream or save Rerun data.
 
+## Included Examples
+
+- `examples.scenes.mobile_aloha_piper_indicator_check`: Mobile ALOHA-style base
+  with two Piper arms inspecting a rack indicator, including top and wrist
+  camera views for headless multi-camera video export. This is the primary
+  example used throughout the README.
+- `examples.scenes.mobile_aloha_ur10e_server_swap`: Mobile ALOHA-style base with
+  two UR10e arms and Robotiq 2F-85 grippers performing a server swap.
+- `examples.scenes.tiago_piper_server_cable_swap`: older TIAGo/Piper
+  server-swap variant kept as a reference scene.
+
 ## Agent Tooling
 
-The most important design choice in this repo is that visual sim work can be
-debugged through deterministic commands and artifacts. That makes it practical
-for humans and coding agents to inspect failures, compare images, and verify
-phase contracts without relying on ad hoc screen observation.
-
-`tools/mj.py` is the main entrypoint:
+The main workflow is intentionally CLI-shaped so humans and agents can inspect
+visual sim behavior through deterministic files instead of screen watching.
 
 ```bash
 # Render one frame from a free camera.
-uv run python tools/mj.py snapshot --az 45 --el -20 --out /tmp/home.png
+uv run mwb debug snapshot \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --az 45 \
+  --el -20 \
+  --out /tmp/home.png
 
 # Render from a named MuJoCo camera at a specific sim time.
-uv run python tools/mj.py snapshot --t 22 --camera top_d435i_cam --out /tmp/camera.png
+uv run mwb debug snapshot \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --t 22 \
+  --camera top_d435i_cam \
+  --out /tmp/camera.png
 
 # Render all scene cameras plus a free camera into a labeled grid.
-uv run python tools/mj.py grid --t 22 --out /tmp/grid.png
+uv run mwb debug grid \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --t 22 \
+  --out /tmp/grid.png
 
 # Print the task plan timeline.
-uv run python tools/mj.py plan
+uv run mwb debug plan --scene examples.scenes.mobile_aloha_piper_indicator_check
 
 # Check phase contracts and write machine-readable artifacts.
-uv run python tools/mj.py contracts --out-root results/runs
+uv run mwb debug contracts \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --out-root results/runs
 
 # Replay one phase and save before/after state snapshots and renders.
-uv run python tools/mj.py phase remove_old_server --out-root results/runs
+uv run mwb debug phase wait_at_server \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --out-root results/runs
 
 # Emit GraphViz DOT for the phase predecessor graph.
-uv run python tools/mj.py phase-graph --out /tmp/phases.dot
+uv run mwb debug phase-graph \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --out /tmp/phases.dot
 
 # Compare two renders.
-uv run python tools/mj.py diff --a /tmp/before.png --b /tmp/after.png --out /tmp/diff.png
+uv run mwb debug diff --a /tmp/before.png --b /tmp/after.png --out /tmp/diff.png
 
 # Sweep IK feasibility for planned arm waypoints.
-uv run python tools/mj.py ik
+uv run mwb debug ik --scene examples.scenes.mobile_aloha_piper_indicator_check
 
 # Produce a compact review packet.
-uv run python tools/mj.py review --out-dir results/review
+uv run mwb debug review \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --out-dir results/review
 ```
 
-`tools/_runtime.py` is the shared non-interactive runtime. It imports a scene,
-builds the MuJoCo model, applies initial state, advances the same scripted
-timeline used by the live runner, and renders frames. Most agent-facing tooling
-is intentionally thin around this module.
+`mujoco_workbench.runtime` is the shared non-interactive runtime behind these
+commands. It imports a scene, builds the MuJoCo model, applies initial state,
+advances the same scripted timeline used by the live runner, and renders frames.
 
-`tools/observability.py` writes plain artifacts:
+`mujoco_workbench.observability` writes plain artifacts:
 
 - `events.jsonl`: append-only phase-boundary events.
 - `summary.json`: CI-friendly pass/fail summary.
@@ -128,18 +158,11 @@ of a phase: active attachments, inactive attachments, base pose expectations,
 grippable object poses, held-object invariants, static joint sets, gripper
 state, and MuJoCo warning counts.
 
-This turns vague failures like "the arm looks wrong" into narrower questions:
-
-- Did the previous phase end in the expected state?
-- Did an equality weld activate or deactivate at the wrong boundary?
-- Did a held object drift while the phase was running?
-- Did a planned waypoint become IK-fragile?
-
 Run contract checks after changing geometry, attachment names, IK targets, step
 timing, or phase labels:
 
 ```bash
-uv run python tools/mj.py contracts --out-root results/runs
+uv run mwb debug contracts --out-root results/runs
 ```
 
 ## Teleop Authoring
@@ -148,7 +171,7 @@ Teleop mode is for shaping task motion directly in Viser when a scripted IK path
 is valid but awkward.
 
 ```bash
-uv run python runner.py --scene mobile_aloha_ur10e_server_swap --teleop
+uv run mwb run examples.scenes.mobile_aloha_ur10e_server_swap --teleop
 ```
 
 The browser exposes TCP drag handles, per-joint sliders, base controls,
@@ -157,8 +180,7 @@ written to `/tmp/teleop_recordings/<scene>/teleop_<UTC>.json` and can be
 replayed:
 
 ```bash
-uv run python runner.py \
-  --scene mobile_aloha_ur10e_server_swap \
+uv run mwb run examples.scenes.mobile_aloha_ur10e_server_swap \
   --play-recording /tmp/teleop_recordings/mobile_aloha_ur10e_server_swap/teleop_YYYYMMDDTHHMMSSZ.json
 ```
 
@@ -167,24 +189,23 @@ phase home.
 
 ## Headless Video Export
 
-`tools/render_pov_videos.py` renders the indicator-check scene from four views:
+The included indicator-check example has a dedicated multi-camera export command:
+
+```bash
+uv run mwb video-export --out-dir /tmp/pov
+```
+
+It renders:
 
 - `forward.mp4`: chassis-mounted top D435i.
 - `left_wrist.mp4`: left wrist D405.
 - `right_wrist.mp4`: right wrist D405.
 - `directorial.mp4`: free-camera hard cuts from authored keyframes.
 
-Stop the live runner before rendering videos so the renderer owns the GL context:
-
-```bash
-./serve.sh stop
-uv run python tools/render_pov_videos.py --out-dir /tmp/pov
-```
-
-The renderer handles timeline-accurate frame stepping, runtime RGBA changes,
+The exporter handles timeline-accurate frame stepping, runtime RGBA changes,
 per-pass RGBA reset, and hiding debug-only geometry. Camera constants for this
-workflow live near the top of `scenes/mobile_aloha_piper_indicator_check.py`.
-Directorial keyframes live in `tools/render_pov_videos.py`.
+workflow live in `examples.scenes.mobile_aloha_piper_indicator_check`.
+Directorial keyframes live in `examples.video_export`.
 
 ## Remote Linux Usage
 
@@ -218,8 +239,9 @@ work.
 
 ## External Assets
 
-MuJoCo Menagerie is intentionally not vendored. `paths.py` resolves it lazily so
-tests and tools that do not touch Menagerie-backed robots can still run.
+MuJoCo Menagerie is intentionally not vendored. `examples.paths` resolves it
+lazily so tests and tools that do not touch Menagerie-backed robots can still
+run.
 
 Default:
 
@@ -233,19 +255,8 @@ Override:
 export MENAGERIE_PATH=/path/to/mujoco_menagerie
 ```
 
-The Mobile ALOHA chassis mesh used by these scenes is vendored in
-`assets/mobile_aloha/`.
-
-## Adding A Scene
-
-See `ARCHITECTURE.md` for the scene module contract and the boundaries between
-scene code, robot loaders, runtime helpers, and debug tooling.
-
-Start a new scene with:
-
-```bash
-./serve.sh start my_scene
-```
+The Mobile ALOHA chassis mesh used by the examples is vendored in
+`examples/assets/mobile_aloha/`.
 
 ## Code Quality
 
@@ -256,11 +267,14 @@ uv run ruff check --fix
 uv run ruff format
 uv run ty check
 uv run pytest
+lychee -v .
 ```
 
 For scene changes, also run at least:
 
 ```bash
-uv run python runner.py --scene mobile_aloha_ur10e_server_swap --inspect
-uv run python tools/mj.py contracts --out-root results/runs
+uv run mwb run examples.scenes.mobile_aloha_piper_indicator_check --inspect
+uv run mwb debug contracts \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --out-root results/runs
 ```

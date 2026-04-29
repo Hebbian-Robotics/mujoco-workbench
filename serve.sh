@@ -1,7 +1,7 @@
 #!/bin/bash
 # Lifecycle helper for the runner. Runs wherever the file lives — no hardcoded
 # paths. Usage:
-#   ./serve.sh start [scene]   # scene defaults to mobile_aloha_ur10e_server_swap
+#   ./serve.sh start [scene]   # scene defaults to the indicator-check example
 #   ./serve.sh stop
 #   ./serve.sh status
 #   ./serve.sh logs [N]
@@ -13,17 +13,17 @@ export PATH="$HOME/.local/bin:$PATH"
 
 LOG="$SCRIPT_DIR/runner.log"
 PIDFILE="$SCRIPT_DIR/runner.pid"
+DEFAULT_SCENE="examples.scenes.mobile_aloha_piper_indicator_check"
 
 case "${1:-status}" in
   start)
-    SCENE="${2:-mobile_aloha_ur10e_server_swap}"
+    SCENE="${2:-$DEFAULT_SCENE}"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
       echo "already running (pid $(cat $PIDFILE))"; exit 0
     fi
-    pkill -f 'runner.py' 2>/dev/null || true
+    pkill -f 'mwb run|mujoco_workbench.cli' 2>/dev/null || true
     sleep 1
-    nohup uv run python "$SCRIPT_DIR/runner.py" \
-      --scene "$SCENE" --host 127.0.0.1 --port 8080 \
+    nohup uv run mwb run "$SCENE" --host 127.0.0.1 --port 8080 \
       > "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
     sleep 6
@@ -36,13 +36,13 @@ case "${1:-status}" in
     ;;
   stop)
     if [ -f "$PIDFILE" ]; then kill "$(cat $PIDFILE)" 2>/dev/null || true; fi
-    pkill -f 'runner.py' 2>/dev/null || true
+    pkill -f 'mwb run|mujoco_workbench.cli' 2>/dev/null || true
     rm -f "$PIDFILE"
     echo stopped
     ;;
   status)
-    if pgrep -af runner.py >/dev/null; then
-      echo running:; pgrep -af runner.py
+    if pgrep -af 'mwb run|mujoco_workbench.cli' >/dev/null; then
+      echo running:; pgrep -af 'mwb run|mujoco_workbench.cli'
       ss -tlnp 2>/dev/null | grep :8080 || true
     else
       echo stopped

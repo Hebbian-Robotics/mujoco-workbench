@@ -15,10 +15,10 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-from arm_handles import ArmSide
-from scene_base import Step, TaskPhase
-from tools.mj import _phase_windows
-from tools.observability import _quat_pitch_roll_rad
+from mujoco_workbench.arm_handles import ArmSide
+from mujoco_workbench.debug_cli import _phase_windows
+from mujoco_workbench.observability import _quat_pitch_roll_rad
+from mujoco_workbench.scene_base import Step, TaskPhase
 
 # ---------------------------------------------------------------------------
 # _quat_pitch_roll_rad — numerical stability across the unit quaternion sphere
