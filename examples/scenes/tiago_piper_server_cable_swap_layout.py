@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from examples.robots.tiago import torso_world_pos_at_zero as tiago_torso_world_pos_at_zero
+from mujoco_workbench.arm_handles import ArmSide
 from mujoco_workbench.scene_base import JointConfig, Position3
 
 Half3 = tuple[float, float, float]
@@ -177,6 +178,10 @@ class _Server:
     half: Half3 = (0.18, 0.22, 0.045)
     slot_z: float = 0.88  # world z of server centre when installed in rack
     mass: float = 0.5
+    handle_y_offset_abs: float = 0.15
+    """Visual grasp target offset from server centerline for bimanual pulls."""
+    handle_x_clearance_m: float = 0.015
+    """How far in front of the server front face the TCP should sit at grip."""
 
 
 @dataclass(frozen=True)
@@ -329,6 +334,21 @@ class DataCenterLayout:
         mjEQ_CONNECT `data` field of a port↔cable-connector equality."""
         return (self.port_local_x_on_server, self.ports.y_offsets[i], 0.0)
 
+    def handle_world_pos_in_rack(self, side: ArmSide) -> Position3:
+        """TCP target for a server-front bimanual grasp in the rack."""
+        y = (
+            -self.server.handle_y_offset_abs
+            if side is ArmSide.LEFT
+            else self.server.handle_y_offset_abs
+        )
+        return np.array(
+            [
+                self.server_front_x - self.server.handle_x_clearance_m,
+                y,
+                self.server.slot_z,
+            ]
+        )
+
     # ---- Patch-panel + cable-anchor derivations ----
     # The patch panel is a 1U fixture mounted on the rack front rails,
     # one rack-unit below the server slot. Each cable anchors at the
@@ -392,6 +412,12 @@ class DataCenterLayout:
                 self.cart.bottom_shelf_z + self.server.half[2],
             ]
         )
+
+    def handle_world_pos_on_cart_top(self, side: ArmSide) -> Position3:
+        """TCP target for gripping the replacement server on the cart."""
+        y = -0.03 if side is ArmSide.LEFT else 0.03
+        server_position = self.new_server_initial_world_pos
+        return np.array([server_position[0], server_position[1] + y, server_position[2]])
 
     # ---- Invariants ----
 

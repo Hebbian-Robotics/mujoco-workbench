@@ -55,6 +55,7 @@ from examples.scenes.mobile_aloha_ur10e_server_swap_layout import (
 from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.ik import PositionOnly, solve_ik
+from mujoco_workbench.placement import camera_xyaxes_for_look_at, standoff_position
 from mujoco_workbench.scene_base import (
     BimanualHandleSeparation,
     CubeID,
@@ -76,7 +77,6 @@ from mujoco_workbench.scene_check import (
     AttachmentConstraint,
     CameraInvariant,
     FixedCameraInvariant,
-    TargetingCameraInvariant,
     WeldAttachment,
 )
 from mujoco_workbench.welds import activate_attachment_weld, deactivate_weld
@@ -122,6 +122,10 @@ BASE_AT_CART_X = 0.30
 BASE_AT_CART_Y = 0.25
 YAW_TO_CART = math.pi / 2.0
 BASE_AT_INSERT = 0.10
+RACK_HANDLE_APPROACH_M = 0.07
+RACK_HANDLE_PULL_CLEAR_M = 0.10
+CART_HANDLE_APPROACH_M = 0.05
+CART_HANDLE_LIFT_CLEARANCE_M = 0.05
 
 
 def base_aux_targets(*, x: float, y: float, yaw: float) -> tuple[tuple[str, float], ...]:
@@ -134,10 +138,7 @@ def base_aux_targets(*, x: float, y: float, yaw: float) -> tuple[tuple[str, floa
 
 
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (
-    # dm_control namespaces attached subtrees as `<model>/`; the d435i.xml's
-    # `d435i_cam` compiles to `top/d435i_cam`. The wrist cams are added
-    # inside the UR10e subtree before attach, so they pick up the side prefix.
-    ("top/d435i_cam", CameraRole.TOP),
+    ("forward_cam", CameraRole.TOP),
     ("left/wrist_d405_cam", CameraRole.WRIST),
     ("right/wrist_d405_cam", CameraRole.WRIST),
 )
@@ -145,14 +146,7 @@ CAMERAS: tuple[tuple[str, CameraRole], ...] = (
 # Camera invariants — pinned at startup by `scene_check.check_scene`, so a
 # future edit that re-parents or flips a camera mode fails fast.
 CAMERA_INVARIANTS: tuple[CameraInvariant, ...] = (
-    # Top cam tracks `rack_frame` so the optical axis stays on the rack as
-    # the base rotates.
-    TargetingCameraInvariant(
-        name="top/d435i_cam",
-        parent_body="top/d435i",
-        targetbody="rack_frame",
-        mode="targetbody",
-    ),
+    FixedCameraInvariant(name="forward_cam", parent_body="base_link"),
     # Wrist cams: 180°-x quat aligns optical axis (-z) with link +z (gripper /
     # TCP axis), so each wrist view looks at whatever the arm is reaching for.
     FixedCameraInvariant(name="left/wrist_d405_cam", parent_body="left/wrist_3_link"),
@@ -987,8 +981,22 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     _add_cart(root, "visual")
 
     # ---------------------- UR10e arms on the Mobile ALOHA front posts -----
-    TCP_OFFSET_FROM_WRIST = [0.0, 0.20, 0.0]  # 2F-85's lens-of-grip along wrist +y
-    WRIST_MESH_OFFSET = [0.04, 0.0, 0.0]
+    # Frame-local placement follows the generic workbench rule:
+    # target = TCP/contact point, standoff = camera depth, xyaxes = look-at.
+    # For this UR10e+2F-85 subtree, wrist +Y is the gripper/TCP axis.
+    tcp_offset_from_wrist = np.array([0.0, 0.20, 0.0])
+    wrist_camera_target = tcp_offset_from_wrist + np.array([0.0, 0.18, 0.0])
+    wrist_camera_position = standoff_position(
+        wrist_camera_target,
+        np.array([0.0, 1.0, -0.40]),
+        distance_m=0.34,
+    )
+    wrist_camera_xyaxes = camera_xyaxes_for_look_at(
+        wrist_camera_position,
+        wrist_camera_target,
+        up_hint=np.array([0.0, 0.0, 1.0]),
+    )
+    wrist_mesh_offset = [0.04, 0.0, 0.0]
     arm_mount_sites = {
         ArmSide.LEFT: LEFT_ARM_MOUNT_SITE,
         ArmSide.RIGHT: RIGHT_ARM_MOUNT_SITE,
@@ -1001,7 +1009,7 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         wrist3.add(
             "site",
             name="tcp",
-            pos=TCP_OFFSET_FROM_WRIST,
+            pos=tcp_offset_from_wrist.tolist(),
             size=[0.006, 0.006, 0.006],
         )
         wrist3.add(
@@ -1009,14 +1017,14 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
             dclass="visual",
             type="mesh",
             mesh=d405_mesh,
-            pos=WRIST_MESH_OFFSET,
+            pos=wrist_mesh_offset,
             rgba=[0.12, 0.12, 0.14, 1.0],
         )
         wrist3.add(
             "camera",
             name="wrist_d405_cam",
-            pos=[0.0, 0.10, 0.0],
-            quat=[0.7071067811865476, -0.7071067811865476, 0.0, 0.0],
+            pos=wrist_camera_position.tolist(),
+            xyaxes=list(wrist_camera_xyaxes),
             mode="fixed",
             fovy=87.0,
         )
@@ -1032,11 +1040,39 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # ---------------------- Top camera (D435i) on the camera pole ---------
     top_d435i = mjcf.from_path(str(D435I_XML))
     top_d435i.model = "top"
-    top_d435i_body = top_d435i.find("body", "d435i")
     top_cam_mount = root.find("site", TOP_CAM_MOUNT_SITE)
     if top_cam_mount is None:
         raise RuntimeError(f"mobile-aloha mount site {TOP_CAM_MOUNT_SITE!r} not found")
     top_cam_mount.attach(top_d435i)
+    base_link_body = root.find("body", "base_link")
+    if base_link_body is None:
+        raise RuntimeError("Mobile ALOHA chassis body 'base_link' not found")
+    # A rearward, high chassis camera gives an overview of the work surface
+    # without staring through the arm mounts when the base turns toward the
+    # cart. The visible D435i mesh remains on the pole; this simulated camera
+    # encodes the useful render view.
+    forward_cam_pos = np.array([-0.25, 0.0, 1.90])
+    forward_cam_target = np.array(
+        [
+            LAYOUT.rack.front_face_x,
+            0.0,
+            LAYOUT.server.slot_z - 0.10,
+        ]
+    )
+    base_link_body.add(
+        "camera",
+        name="forward_cam",
+        pos=forward_cam_pos.tolist(),
+        xyaxes=list(
+            camera_xyaxes_for_look_at(
+                forward_cam_pos,
+                forward_cam_target,
+                up_hint=np.array([0.0, 0.0, 1.0]),
+            )
+        ),
+        mode="fixed",
+        fovy=60.0,
+    )
 
     # ---------------------- Rack (static, open front) ---------------------
     rack_cfg = LAYOUT.rack
@@ -1072,17 +1108,6 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         (0.0, 0.0, shelf_local_z),
         (rhx - rack_wall_t, rhy - rack_wall_t, shelf_half_z),
     )
-
-    # Top-camera TARGETBODY needs `rack_frame` to exist as the target.
-    if top_d435i_body is not None:
-        top_d435i_body.add(
-            "camera",
-            name="d435i_cam",
-            pos=[0.0, 0.0, 0.0],
-            mode="targetbody",
-            target=rack,
-            fovy=69.0,  # D435i colour-sensor horizontal FOV ≈ 69°
-        )
 
     # ---------------------- Servers (rack + cart-top) ---------------------
     _add_server_body(
@@ -1494,12 +1519,25 @@ def make_task_plan(
     handle_in_rack: dict[ArmSide, Position3] = {
         side: LAYOUT.handle_world_pos_in_rack(side) for side in ARM_PREFIXES
     }
-    # Approach: 7 cm in front of each handle, same Y/Z. Gives the gripper
-    # clear airspace before closing on the bezel cylinder.
+    # Approach/retract points are derived from the handle surface point and
+    # world +X approach direction: the TCP starts in front of the bezel, touches
+    # the handle, then pulls the server straight out without clipping the rack.
     approach_in_rack = {
-        side: handle_in_rack[side] + np.array([-0.07, 0.0, 0.0]) for side in ARM_PREFIXES
+        side: standoff_position(
+            handle_in_rack[side],
+            np.array([1.0, 0.0, 0.0]),
+            distance_m=RACK_HANDLE_APPROACH_M,
+        )
+        for side in ARM_PREFIXES
     }
-    pull_clear = {side: handle_in_rack[side] + np.array([-0.10, 0.0, 0.0]) for side in ARM_PREFIXES}
+    pull_clear = {
+        side: standoff_position(
+            handle_in_rack[side],
+            np.array([1.0, 0.0, 0.0]),
+            distance_m=RACK_HANDLE_PULL_CLEAR_M,
+        )
+        for side in ARM_PREFIXES
+    }
     snap_by_side = {ArmSide.LEFT: snap_l, ArmSide.RIGHT: snap_r}
     q_approach_a = {side: snap_by_side[side](approach_in_rack[side])[0] for side in ARM_PREFIXES}
     q_at_handle_a = {side: snap_by_side[side](handle_in_rack[side])[0] for side in ARM_PREFIXES}
@@ -1600,11 +1638,15 @@ def make_task_plan(
     )
     snap_cart = {ArmSide.LEFT: snap_l_cart, ArmSide.RIGHT: snap_r_cart}
     # 5 cm above rest pose so the final descent is a clean vertical settle.
+    place_bottom = {side: LAYOUT.handle_world_pos_on_cart_bottom(side) for side in ARM_PREFIXES}
     approach_bottom = {
-        side: LAYOUT.handle_world_pos_on_cart_bottom(side) + np.array([0.0, 0.0, 0.05])
+        side: standoff_position(
+            place_bottom[side],
+            np.array([0.0, 0.0, -1.0]),
+            distance_m=CART_HANDLE_LIFT_CLEARANCE_M,
+        )
         for side in ARM_PREFIXES
     }
-    place_bottom = {side: LAYOUT.handle_world_pos_on_cart_bottom(side) for side in ARM_PREFIXES}
     # Retract: 10 cm up + 10 cm back. "Back from cart" is -Y in world coords.
     retract_bottom = {
         side: place_bottom[side] + np.array([0.0, -0.10, 0.10]) for side in ARM_PREFIXES
@@ -1686,11 +1728,15 @@ def make_task_plan(
         )
 
     # === RETRIEVE_NEW_SERVER (arm-only at base = cart) ====================
+    grasp_top = {side: LAYOUT.handle_world_pos_on_cart_top(side) for side in ARM_PREFIXES}
     approach_top = {
-        side: LAYOUT.handle_world_pos_on_cart_top(side) + np.array([0.0, -0.05, 0.0])
+        side: standoff_position(
+            grasp_top[side],
+            np.array([0.0, 1.0, 0.0]),
+            distance_m=CART_HANDLE_APPROACH_M,
+        )
         for side in ARM_PREFIXES
     }
-    grasp_top = {side: LAYOUT.handle_world_pos_on_cart_top(side) for side in ARM_PREFIXES}
     lift_top = {side: grasp_top[side] + np.array([0.0, 0.0, 0.03]) for side in ARM_PREFIXES}
 
     q_above_top = {side: snap_cart[side](approach_top[side])[0] for side in ARM_PREFIXES}

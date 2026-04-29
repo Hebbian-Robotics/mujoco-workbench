@@ -15,6 +15,41 @@ Relevant modules:
 - `mujoco_workbench.phase_monitor`: live runner enforcement.
 - `mujoco_workbench.runtime`: batch timeline replay used by debug commands.
 
+## Breaking Down Large Motions
+
+Use phases to make placement explicit. A good phase should change one kind of
+state at a time:
+
+- Base-only movement: drive, yaw, translate, lift, or align the chassis while
+  arm joints stay static.
+- Arm-only movement: approach, touch/grip, pull/insert, release, or retract
+  while base/lift joints stay static.
+- Attachment state: activate/deactivate one semantic grasp, weld, connect, or
+  visual state change at an authored boundary.
+
+For long or fragile motions, split into minute waypoints:
+
+- `approach`: standoff point in free space, before contact.
+- `at_target`: TCP/contact point on the surface.
+- `hold_or_grip`: no pose change; only gripper/attachment state changes.
+- `clearance`: back out along the same surface normal or lift direction.
+- `transfer`: move base or lift while the object is held.
+- `seat_or_release`: final surface/slot point, then deactivate the hold.
+
+Derive these waypoints from layout geometry, not hand literals. Use:
+
+```bash
+uv run mwb debug surface-point ...
+uv run mwb debug standoff ...
+uv run mwb debug camera-look-at ...
+```
+
+Contract the boundary of each phase with outcome facts: base aux pose,
+expected object pose, active/inactive attachments, static joint sets, held-object
+levelness, and qacc sentinels. The indicator-check pattern is the model:
+drive straight, yaw where the swept radius clears, translate into final click
+pose, then move arms while the base is frozen.
+
 Run all contracts:
 
 ```bash
@@ -54,4 +89,3 @@ debug artifacts stay identical.
 Do not make contracts assert implementation details. Assert outcomes: base pose,
 attachment state, grippable pose, held-object invariants, static joints, gripper
 state, or MuJoCo warning counts.
-

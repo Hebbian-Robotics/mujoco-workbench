@@ -50,6 +50,13 @@ from mujoco_workbench.observability import (
     make_run_directory,
     phase_contract_to_json_dict,
 )
+from mujoco_workbench.placement import (
+    body_world_aabb,
+    camera_xyaxes_for_look_at,
+    geom_world_aabb,
+    standoff_position,
+    surface_point_from_aabb,
+)
 from mujoco_workbench.rerun_stream import RerunStreamer
 from mujoco_workbench.runtime import (
     AzimuthDeg,
@@ -218,6 +225,16 @@ def _write_optional_rerun_phase_log(
             contract_ok=bool(event["contract_ok"]),
             message="ok" if event["contract_ok"] else "failed",
         )
+
+
+def _format_xyz(vector: np.ndarray | tuple[float, float, float]) -> str:
+    x, y, z = np.asarray(vector, dtype=float)
+    return f"{x:.6f},{y:.6f},{z:.6f}"
+
+
+def _format_xyz_mjcf(vector: np.ndarray | tuple[float, float, float]) -> str:
+    x, y, z = np.asarray(vector, dtype=float)
+    return f"{x:.6f} {y:.6f} {z:.6f}"
 
 
 def _advance_context(
@@ -553,6 +570,95 @@ def grid(
     ]
     iio.imwrite(out, _tile_grid(images, labels))
     typer.echo(f"rendered {len(images)} tiles → {out}")
+
+
+# ---- placement helpers -------------------------------------------------------
+
+
+@app.command("camera-look-at")
+def camera_look_at(
+    position: Annotated[str, typer.Option(help="camera position 'x,y,z'")],
+    target: Annotated[str, typer.Option(help="target point 'x,y,z'")],
+    up: Annotated[
+        str,
+        typer.Option(
+            help="horizon/up hint 'x,y,z'; use parent-frame up for fixed cameras",
+        ),
+    ] = "0,0,1",
+) -> None:
+    """Print MuJoCo `xyaxes` for a fixed camera aimed at a target point."""
+    camera_position = np.asarray(parse_world_point(position, field_name="position"), dtype=float)
+    target_position = np.asarray(parse_world_point(target, field_name="target"), dtype=float)
+    up_hint = np.asarray(parse_world_point(up, field_name="up"), dtype=float)
+    xyaxes = camera_xyaxes_for_look_at(camera_position, target_position, up_hint=up_hint)
+    typer.echo(f"position={_format_xyz(camera_position)}")
+    typer.echo(f"target={_format_xyz(target_position)}")
+    typer.echo(f"xyaxes={_format_xyz(xyaxes[:3])},{_format_xyz(xyaxes[3:])}")
+    typer.echo(
+        "mjcf: "
+        f'<camera pos="{_format_xyz_mjcf(camera_position)}" '
+        f'xyaxes="{_format_xyz_mjcf(xyaxes[:3])} {_format_xyz_mjcf(xyaxes[3:])}" '
+        'mode="fixed"/>'
+    )
+
+
+@app.command("standoff")
+def standoff(
+    target: Annotated[str, typer.Option(help="target point 'x,y,z'")],
+    direction: Annotated[
+        str,
+        typer.Option(help="approach direction from camera/TCP toward target, 'x,y,z'"),
+    ],
+    distance: Annotated[float, typer.Option("--distance", help="standoff distance in metres")],
+) -> None:
+    """Print a point backed away from a target by a fixed distance."""
+    target_position = np.asarray(parse_world_point(target, field_name="target"), dtype=float)
+    approach_direction = np.asarray(
+        parse_world_point(direction, field_name="direction"), dtype=float
+    )
+    position = standoff_position(target_position, approach_direction, distance_m=distance)
+    typer.echo(f"target={_format_xyz(target_position)}")
+    typer.echo(f"direction={_format_xyz(approach_direction)}")
+    typer.echo(f"standoff={_format_xyz(position)}")
+
+
+@app.command("surface-point")
+def surface_point(
+    scene: SceneOpt = DEFAULT_SCENE,
+    body: Annotated[
+        str | None,
+        typer.Option(help="body name whose direct geoms define the surface"),
+    ] = None,
+    geom: Annotated[
+        str | None,
+        typer.Option(help="geom name whose AABB defines the surface"),
+    ] = None,
+    normal: Annotated[
+        str,
+        typer.Option(help="outward normal from object toward robot/camera, 'x,y,z'"),
+    ] = "0,-1,0",
+    clearance: Annotated[
+        float,
+        typer.Option("--clearance", help="positive offset outside the surface in metres"),
+    ] = 0.0,
+    t: TOpt = 0.0,
+) -> None:
+    """Print a clearance point just outside a body or geom AABB."""
+    if (body is None) == (geom is None):
+        raise typer.BadParameter("pass exactly one of --body or --geom")
+    ctx = build_scene_and_advance(scene, Seconds(t))
+    aabb = (
+        body_world_aabb(ctx.model, ctx.data, body)
+        if body is not None
+        else geom_world_aabb(ctx.model, ctx.data, str(geom))
+    )
+    outward_normal = np.asarray(parse_world_point(normal, field_name="normal"), dtype=float)
+    point = surface_point_from_aabb(aabb, outward_normal, clearance_m=clearance)
+    typer.echo(f"object={aabb.name}")
+    typer.echo(f"aabb_min={_format_xyz(aabb.min_xyz)}")
+    typer.echo(f"aabb_max={_format_xyz(aabb.max_xyz)}")
+    typer.echo(f"normal={_format_xyz(outward_normal)}")
+    typer.echo(f"surface_point={_format_xyz(point)}")
 
 
 # ---- plan --------------------------------------------------------------------

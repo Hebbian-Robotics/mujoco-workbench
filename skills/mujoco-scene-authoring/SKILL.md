@@ -43,6 +43,53 @@ Keep generic stepping/rendering/contract behavior in `mujoco_workbench`.
 Prefer layout dataclasses for durable world-frame geometry constants. Keep
 robot/sensor loading details in `examples/robots/` unless they are truly generic.
 
+## Placement Pattern
+
+For cameras and contact/touch poses, calculate first and teleop second. The
+indicator-check scene is the reference pattern:
+
+- Express target geometry in the layout module: object centers, front faces,
+  alert/contact points, row normals, chassis click poses, and clearance margins.
+- Use `mwb debug surface-point` to pick a point just outside an object AABB.
+  The normal points outward from the object toward the robot/camera.
+- Use `mwb debug standoff` to back a camera, TCP, or wrist mount away from
+  that point by a chosen depth.
+- Use `mwb debug camera-look-at` to compute MuJoCo `xyaxes`; MuJoCo cameras
+  look along local `-z`, so do not guess quaternions by eye.
+- Bake the resulting values into named layout constants or scene tunables, then
+  verify with rendered snapshots/grids and only use teleop for final joint poses.
+
+Examples:
+
+```bash
+uv run mwb debug surface-point \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --geom light_left_r3_s10 \
+  --normal 0,-1,0 \
+  --clearance 0.02
+
+uv run mwb debug standoff \
+  --target 5.10,1.04,1.00 \
+  --direction 0,1,0 \
+  --distance 0.25
+
+uv run mwb debug camera-look-at \
+  --position 5.10,0.79,1.08 \
+  --target 5.10,1.04,1.00 \
+  --up 0,0,1
+```
+
+For wrist cameras, define the tool axis in the link-local frame, place the mesh
+and camera outside the wrist housing with a small standoff, and aim the camera
+at the TCP/contact point. The camera should frame the interaction target, not
+the robot's own wrist geometry. Declare `CAMERA_INVARIANTS` so parent-body or
+mode regressions fail during `--inspect`.
+
+For server/rack contact, derive the click pose from the rack face plus the
+robot's nose/swept-corner extents. Keep yaw-in-place and final approach as
+separate base-only steps when rotation would otherwise clip into nearby static
+geometry.
+
 Use fully qualified scene modules in commands:
 
 ```bash
@@ -61,4 +108,3 @@ uv run mwb run examples.scenes.mobile_aloha_piper_indicator_check --inspect
 
 If the edit touches task timing, phase labels, geometry, attachments, or IK
 targets, also run contract checks.
-

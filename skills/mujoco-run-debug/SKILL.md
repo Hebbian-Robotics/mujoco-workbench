@@ -44,6 +44,28 @@ uv run mwb debug grid \
   --out /tmp/grid.png
 ```
 
+Calculate placement values before hand-tuning camera/contact poses:
+
+```bash
+# Aim a MuJoCo fixed camera at a world target; output is ready for xyaxes.
+uv run mwb debug camera-look-at \
+  --position 5.10,0.79,1.08 \
+  --target 5.10,1.04,1.00
+
+# Pick a clearance point just outside a scene object.
+uv run mwb debug surface-point \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --geom light_left_r3_s10 \
+  --normal 0,-1,0 \
+  --clearance 0.02
+
+# Back a TCP/camera away from the target along an approach ray.
+uv run mwb debug standoff \
+  --target 5.10,1.04,1.00 \
+  --direction 0,1,0 \
+  --distance 0.25
+```
+
 Print the task plan:
 
 ```bash
@@ -70,4 +92,3 @@ committing generated videos, logs, caches, or run artifacts.
 Headless rendering sets `MUJOCO_GL` before importing MuJoCo: `glfw` on macOS,
 `egl` on Linux. If rendering fails on Linux, suspect EGL/driver availability
 before changing scene code.
-

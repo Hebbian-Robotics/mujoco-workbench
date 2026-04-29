@@ -55,13 +55,13 @@ from examples.scenes.tiago_piper_server_cable_swap_layout import HOME_ARM_Q, IK_
 from mujoco_workbench.arm_handles import ArmHandles, ArmSide
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.ik import PositionOnly, solve_ik
+from mujoco_workbench.placement import camera_xyaxes_for_look_at, standoff_position
 from mujoco_workbench.scene_base import CubeID, GripperState, Position3, Step, make_cube_id
 from mujoco_workbench.scene_check import (
     AttachmentConstraint,
     CameraInvariant,
     ConnectAttachment,
     FixedCameraInvariant,
-    TargetingCameraInvariant,
     WeldAttachment,
 )
 from mujoco_workbench.welds import activate_attachment_weld
@@ -77,6 +77,9 @@ ROBOT_KIND = "piper"
 # 6-DOF Piper arm chain.
 IK_LOCKED_JOINT_NAMES: tuple[str, ...] = ("torso_lift_joint",)
 ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+RACK_HANDLE_APPROACH_M = 0.07
+RACK_HANDLE_PULL_CLEAR_M = 0.40
+CART_HANDLE_LIFT_CLEARANCE_M = 0.10
 # Grippable objects addressable via Step.weld_activate / weld_deactivate.
 # Index order matters: the runner uses it as an int index into this list.
 GRIPPABLES: tuple[str, ...] = (
@@ -116,10 +119,7 @@ class DataCenterAux(StrEnum):
 AUX_ACTUATOR_NAMES: tuple[str, ...] = tuple(m.value for m in DataCenterAux)
 
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (
-    # Realsense D435i attached at the top of the camera pole. dm_control
-    # namespaces names of attached subtrees with `<model>/`, so the camera
-    # the d435i.xml declares as `d435i_cam` compiles as `top/d435i_cam`.
-    ("top/d435i_cam", CameraRole.TOP),
+    ("forward_cam", CameraRole.TOP),
     # Wrist D405 cameras are added directly inside the piper subtree
     # (`{side}link6`) before attach so they pick up the piper's namespace
     # prefix. Result: `left/wrist_d405_cam`, `right/wrist_d405_cam`.
@@ -128,26 +128,11 @@ CAMERAS: tuple[tuple[str, CameraRole], ...] = (
 )
 
 # Camera invariants — pinned at startup by `scene_check.check_scene`. Each
-# entry locks a camera's structural identity (parent body, MuJoCo cam mode,
-# optional targetbody) so a future edit that flips the top cam to FIXED,
-# or accidentally re-parents a wrist cam to base_link, fails fast at
-# startup with a clear message instead of as "the wrist view looks
-# wrong" days later in viser.
+# entry locks a camera's structural identity (parent body and MuJoCo cam mode)
+# so a future edit that accidentally re-parents a wrist cam to base_link fails
+# fast at startup with a clear message.
 CAMERA_INVARIANTS: tuple[CameraInvariant, ...] = (
-    # Top camera rides the camera pole's mesh body (`top/d435i`), attached
-    # to the static `base_link` (not the moving torso_lift_link) so the
-    # view stays stable regardless of lift qpos. Targets `rack_frame`, so
-    # the optical axis tracks the rack as the robot's base rotates.
-    TargetingCameraInvariant(
-        name="top/d435i_cam",
-        parent_body="top/d435i",
-        targetbody="rack_frame",
-        mode="targetbody",
-    ),
-    # Wrist cams mount on each arm's link6 (`left/link6`, `right/link6`)
-    # in FIXED mode. The 180°-x quat on the camera makes its optical
-    # axis (-z) align with link6's +z (the gripper axis), so each wrist
-    # view always looks at whatever the arm is reaching for.
+    FixedCameraInvariant(name="forward_cam", parent_body="base_link"),
     FixedCameraInvariant(name="left/wrist_d405_cam", parent_body="left/link6"),
     FixedCameraInvariant(name="right/wrist_d405_cam", parent_body="right/link6"),
 )
@@ -784,7 +769,18 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # centreline; arm_mount.z = -0.15 is the natural shoulder height;
     # ±arm_mount.y_abs places each arm on its respective side.
     arm_mount = LAYOUT.arm_mount
-    WRIST_MESH_OFFSET = [0.0, 0.0, 0.03]
+    wrist_tcp_position = np.array([0.0, 0.0, 0.14])
+    wrist_camera_position = standoff_position(
+        wrist_tcp_position,
+        np.array([0.0, 0.0, 1.0]),
+        distance_m=0.10,
+    )
+    wrist_camera_xyaxes = camera_xyaxes_for_look_at(
+        wrist_camera_position,
+        wrist_tcp_position,
+        up_hint=np.array([0.0, 1.0, 0.0]),
+    )
+    wrist_mesh_offset = [0.0, 0.0, 0.03]
     for side, y_sign in ((ArmSide.LEFT, -1.0), (ArmSide.RIGHT, 1.0)):
         piper = load_piper(side)
         link6 = piper.find("body", "link6")
@@ -795,29 +791,26 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         link6.add(
             "site",
             name="tcp",
-            pos=[0.0, 0.0, 0.14],
+            pos=wrist_tcp_position.tolist(),
             size=[0.006, 0.006, 0.006],
         )
-        # Wrist camera mesh — orientation chosen so the mount face sits
-        # against link6 and the lens points sideways (matches how a real
-        # D405 mounts on an Aloha-style Piper wrist).
+        # Wrist camera placement is derived in link-local coordinates:
+        # camera sits behind the TCP along the tool axis and aims at the
+        # TCP/contact point. This keeps the view on the interaction target
+        # instead of filling the frame with wrist geometry.
         link6.add(
             "geom",
             dclass="visual",
             type="mesh",
             mesh=d405_mesh,
-            pos=WRIST_MESH_OFFSET,
+            pos=wrist_mesh_offset,
             rgba=[0.12, 0.12, 0.14, 1.0],
         )
-        # FIXED-mode camera with a 180°-x quat so the optical axis (cam -z)
-        # aligns with link6 +z (the gripper / TCP axis) — the wrist view
-        # always looks at whatever the arm is reaching for, symmetrically
-        # for both sides.
         link6.add(
             "camera",
             name="wrist_d405_cam",
-            pos=[0.0, 0.0, 0.08],
-            quat=[0.0, 1.0, 0.0, 0.0],
+            pos=wrist_camera_position.tolist(),
+            xyaxes=list(wrist_camera_xyaxes),
             mode="fixed",
             fovy=87.0,
         )
@@ -853,7 +846,6 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # ALLOWED_STATIC_OVERLAPS).
     top_d435i = mjcf.from_path(str(D435I_XML))
     top_d435i.model = "top"
-    top_d435i_body = top_d435i.find("body", "d435i")
     top_cam_mount = base.add(
         "site",
         name="top_cam_mount",
@@ -862,9 +854,22 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         size=[0.001, 0.001, 0.001],
     )
     top_cam_mount.attach(top_d435i)
-    # The TARGETBODY camera is added AFTER `rack_frame` is built (below);
-    # mjcf resolves cross-namescope refs by Element identity, and the
-    # rack_frame Element doesn't exist yet at this point.
+    forward_cam_pos = np.array([TOP_POLE_X, 0.0, 1.485])
+    forward_cam_target = np.array([LAYOUT.rack.front_face_x, 0.0, LAYOUT.server.slot_z])
+    base.add(
+        "camera",
+        name="forward_cam",
+        pos=forward_cam_pos.tolist(),
+        xyaxes=list(
+            camera_xyaxes_for_look_at(
+                forward_cam_pos,
+                forward_cam_target,
+                up_hint=np.array([0.0, 0.0, 1.0]),
+            )
+        ),
+        mode="fixed",
+        fovy=42.0,
+    )
 
     # ---------------------- Rack (static, open front) ------------------------
     rack_cfg = LAYOUT.rack
@@ -939,20 +944,6 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
             pos=[cables_cfg.patch_panel_half_x, y, 0.012],
             size=[0.001, 0.018, 0.005],
             rgba=list(rgba),
-        )
-
-    # Now that `rack_frame` is built, add the top-camera with a TARGETBODY
-    # reference to it. Passing the Element (not the string `"rack_frame"`)
-    # lets mjcf resolve the reference across namescopes — the camera lives
-    # inside `top/`, the target lives at scene root.
-    if top_d435i_body is not None:
-        top_d435i_body.add(
-            "camera",
-            name="d435i_cam",
-            pos=[0.0, 0.0, 0.0],
-            mode="targetbody",
-            target=rack,
-            fovy=69.0,  # D435i colour-sensor horizontal FOV ≈ 69°
         )
 
     # ---------------------- Servers (rack + cart-top) ----------------------
@@ -1576,13 +1567,28 @@ def make_task_plan(
     # so the arm joints have to be solved against the reversed base
     # geometry to land the right world-frame TCP.
     snap_l, snap_r = seed_at_lift(LAYOUT.lift.server, base_x=BASE_PRE_EXTRACT)
-    handle_x = LAYOUT.server_front_x - 0.015
-    handle_L = np.array([handle_x, -0.15, LAYOUT.server.slot_z])
-    handle_R = np.array([handle_x, +0.15, LAYOUT.server.slot_z])
-    approach_L = handle_L + np.array([-0.07, 0.0, 0.0])
-    approach_R = handle_R + np.array([-0.07, 0.0, 0.0])
-    pulled_out_L = handle_L + np.array([-0.40, 0.0, 0.0])
-    pulled_out_R = handle_R + np.array([-0.40, 0.0, 0.0])
+    handle_L = LAYOUT.handle_world_pos_in_rack(ArmSide.LEFT)
+    handle_R = LAYOUT.handle_world_pos_in_rack(ArmSide.RIGHT)
+    approach_L = standoff_position(
+        handle_L,
+        np.array([1.0, 0.0, 0.0]),
+        distance_m=RACK_HANDLE_APPROACH_M,
+    )
+    approach_R = standoff_position(
+        handle_R,
+        np.array([1.0, 0.0, 0.0]),
+        distance_m=RACK_HANDLE_APPROACH_M,
+    )
+    pulled_out_L = standoff_position(
+        handle_L,
+        np.array([1.0, 0.0, 0.0]),
+        distance_m=RACK_HANDLE_PULL_CLEAR_M,
+    )
+    pulled_out_R = standoff_position(
+        handle_R,
+        np.array([1.0, 0.0, 0.0]),
+        distance_m=RACK_HANDLE_PULL_CLEAR_M,
+    )
     qL_app, _ = snap_l(approach_L)
     qL_at, _ = snap_l(handle_L)
     qL_out, _ = snap_l(pulled_out_L)
@@ -1701,15 +1707,18 @@ def make_task_plan(
         base_y=BASE_AT_CART_Y,
         base_yaw=YAW_TO_CART,
     )
-    cart_top_world = LAYOUT.new_server_initial_world_pos
-    new_handle_L = np.array(
-        [float(cart_top_world[0]), float(cart_top_world[1]) - 0.03, float(cart_top_world[2])]
+    new_handle_L = LAYOUT.handle_world_pos_on_cart_top(ArmSide.LEFT)
+    new_handle_R = LAYOUT.handle_world_pos_on_cart_top(ArmSide.RIGHT)
+    new_approach_L = standoff_position(
+        new_handle_L,
+        np.array([0.0, 0.0, -1.0]),
+        distance_m=CART_HANDLE_LIFT_CLEARANCE_M,
     )
-    new_handle_R = np.array(
-        [float(cart_top_world[0]), float(cart_top_world[1]) + 0.03, float(cart_top_world[2])]
+    new_approach_R = standoff_position(
+        new_handle_R,
+        np.array([0.0, 0.0, -1.0]),
+        distance_m=CART_HANDLE_LIFT_CLEARANCE_M,
     )
-    new_approach_L = new_handle_L + np.array([0.0, 0.0, 0.10])
-    new_approach_R = new_handle_R + np.array([0.0, 0.0, 0.10])
     qL_napp, _ = snap_l_cart(new_approach_L)
     qL_ngrip, _ = snap_l_cart(new_handle_L)
     qR_napp, _ = snap_r_cart(new_approach_R)
