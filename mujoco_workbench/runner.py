@@ -196,6 +196,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.rerun_port is not None and args.rerun_connect is not None:
         parser.error("--rerun-port and --rerun-connect are mutually exclusive")
 
+    print(f"Loading {args.scene} ...")
     scene = load_scene(args.scene)
     print(f"Building scene: {scene.display_name}")
 
