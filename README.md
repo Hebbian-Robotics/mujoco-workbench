@@ -1,15 +1,29 @@
 # mujoco-workbench
 
-MuJoCo robotics simulation workbench with Viser playback, Rerun observability,
-headless multi-camera video export, scripted task timelines, phase contracts,
-and file-based debug artifacts designed for agent-assisted development.
+https://github.com/user-attachments/assets/af5a213e-7783-4ee4-82b9-29833cae0406
 
-The reusable code lives in `mujoco_workbench/`. The current robot demos live in
-`examples/`, so they remain available without making the package itself specific
-to one robot, rack, or task.
+A prototyping tool that lets you define robot behaviors visually in MuJoCo simulation, so your team is aligned on the desired behavior of your robot trajectory before writing a single training loop.
 
-For the code map, module boundaries, and scene contract, read
-`ARCHITECTURE.md`.
+**How it works:** install the bundled Agent skills, describe what you want, and the agent scaffolds a working sim for you. No MuJoCo experience required to get started. The skills teach the agent the `mwb` CLI, the scene layout conventions, and the debug tools so it can iterate on behavior without you needing to know the plumbing.
+
+The reusable runtime lives in `mujoco_workbench/`. Prebuilt robot demos live in `examples/`. For the code map and module boundaries, read `ARCHITECTURE.md`.
+
+## The `mwb` CLI
+
+Everything in this repo is driven through a single command-line entry point: `mwb`, short for **m**ujoco-**w**ork**b**ench. It's the one tool you (and your agent) use to run scenes, render snapshots, check phase contracts, export videos, and inspect timelines.
+
+```bash
+uv run mwb run <scene>          # launch a scene in the browser
+uv run mwb debug snapshot ...   # render a single frame
+uv run mwb debug contracts ...  # verify phase contracts
+uv run mwb video-export ...     # headless multi-camera video
+```
+
+The agent skills are built around this CLI, so when an agent scaffolds or edits a scene it iterates by calling `mwb` subcommands rather than poking at MuJoCo internals directly.
+
+## Requirements
+
+MuJoCo simulation runs on CPU alone — you can prototype scenes, inspect timelines, and check phase contracts on any modern laptop. A GPU is only required if you want to render and save videos (e.g. `mwb video-export` or headless multi-camera output), since offscreen rendering uses EGL/OpenGL.
 
 ## Install
 
@@ -19,8 +33,11 @@ Install dependencies:
 uv sync
 ```
 
-Clone MuJoCo Menagerie for the included robot examples. The default lookup path
-is `~/mujoco_menagerie`; set `MENAGERIE_PATH` if you keep it elsewhere.
+Clone MuJoCo Menagerie for the included robot examples. Menagerie is Google
+DeepMind's open-source library of high-quality MuJoCo models for real-world
+robots (arms, grippers, humanoids, mobile bases) — the workbench loads its
+robots and scene assets straight from there. The default lookup path is
+`~/mujoco_menagerie`; set `MENAGERIE_PATH` if you keep it elsewhere.
 
 ```bash
 git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git ~/mujoco_menagerie
@@ -41,7 +58,7 @@ Install all bundled skills:
 npx skills add Hebbian-Robotics/mujoco-workbench --skill '*'
 ```
 
-## Run A Scene
+## Run An Example Prebuilt Scene
 
 Use the single package CLI:
 
