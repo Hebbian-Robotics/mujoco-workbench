@@ -16,7 +16,7 @@ streams Rerun events.
 
 `mujoco_workbench.debug_cli` implements the `mwb debug ...` subcommands:
 snapshots, camera grids, videos, timelines, phase checks, phase replays, image
-diffs, IK sweeps, and review packets.
+diffs, IK sweeps, timeline clearance checks, and review packets.
 
 `mujoco_workbench.runtime` is the non-interactive counterpart to the runner. It
 loads a scene, applies initial state, advances the scripted timeline, and

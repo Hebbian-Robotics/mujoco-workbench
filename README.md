@@ -132,6 +132,14 @@ uv run mwb debug diff --a /tmp/before.png --b /tmp/after.png --out /tmp/diff.png
 # Sweep IK feasibility for planned arm waypoints.
 uv run mwb debug ik --scene examples.scenes.mobile_aloha_piper_indicator_check
 
+# Replay the timeline and report close/clipping geom pairs.
+uv run mwb debug clearance \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --sample-dt 0.50 \
+  --max-distance 0.005 \
+  --exact-geom \
+  --top 12
+
 # Produce a compact review packet.
 uv run mwb debug review \
   --scene examples.scenes.mobile_aloha_piper_indicator_check \
@@ -164,6 +172,20 @@ timing, or phase labels:
 ```bash
 uv run mwb debug contracts --out-root results/runs
 ```
+
+Run clearance checks after changing robot/object placement or carry paths:
+
+```bash
+uv run mwb debug clearance \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --sample-dt 0.50 \
+  --max-distance 0.005 \
+  --exact-geom
+```
+
+`clearance` is diagnostic by default and exits 0 so intentional contact scenes,
+such as the indicator check, still pass. Use `--fail-below 0` or a positive
+clearance threshold when a phase must be collision-free.
 
 ## Teleop Authoring
 

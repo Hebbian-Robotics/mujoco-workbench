@@ -44,6 +44,22 @@ uv run mwb debug grid \
   --out /tmp/grid.png
 ```
 
+Check timeline clearance after changing scene geometry or motion:
+
+```bash
+uv run mwb debug clearance \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --sample-dt 0.50 \
+  --max-distance 0.005 \
+  --exact-geom \
+  --top 12
+```
+
+`clearance` reports the worst arm-arm, arm-static, arm-grippable, and
+grippable-static pairs with time and active step labels. It exits 0 by default
+because some tasks intentionally touch objects; add `--fail-below 0` when any
+penetration should fail the run.
+
 Calculate placement values before hand-tuning camera/contact poses:
 
 ```bash

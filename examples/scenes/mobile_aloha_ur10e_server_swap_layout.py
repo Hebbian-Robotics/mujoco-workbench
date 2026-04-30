@@ -259,13 +259,13 @@ class DataCenterLayout:
     # Z = slot_z. World-frame IK targets for Action A grasp / Action D release.
 
     def handle_world_pos_in_rack(self, side: ArmSide) -> Position3:
-        y = self.handles.y_offset_abs if side is ArmSide.RIGHT else -self.handles.y_offset_abs
+        y = self.handles.y_offset_abs if side is ArmSide.LEFT else -self.handles.y_offset_abs
         return np.array([self.rack.front_face_x, y, self.server.slot_z])
 
     def handle_local_pos_on_server(self, side: ArmSide) -> tuple[float, float, float]:
         """Handle position in the server's local frame — used to attach
         the handle geom to the server body."""
-        y = self.handles.y_offset_abs if side is ArmSide.RIGHT else -self.handles.y_offset_abs
+        y = self.handles.y_offset_abs if side is ArmSide.LEFT else -self.handles.y_offset_abs
         return (-self.server.half[0], y, 0.0)
 
     # Cart center is at (0.30, 0.90), but the server rests at (0.30, 0.80) —
@@ -308,9 +308,7 @@ class DataCenterLayout:
     def handle_world_pos_on_cart_top(self, side: ArmSide) -> Position3:
         """Handle position when the new server sits on the cart top
         shelf — Action C grip target."""
-        y_offset = (
-            self.handles.y_offset_abs if side is ArmSide.RIGHT else -self.handles.y_offset_abs
-        )
+        y_offset = self.handles.y_offset_abs if side is ArmSide.LEFT else -self.handles.y_offset_abs
         return np.array(
             [
                 self.server_on_cart_x,
@@ -322,9 +320,7 @@ class DataCenterLayout:
     def handle_world_pos_on_cart_bottom(self, side: ArmSide) -> Position3:
         """Handle position when the old server is placed on the bottom
         tray — Action B release target."""
-        y_offset = (
-            self.handles.y_offset_abs if side is ArmSide.RIGHT else -self.handles.y_offset_abs
-        )
+        y_offset = self.handles.y_offset_abs if side is ArmSide.LEFT else -self.handles.y_offset_abs
         return np.array(
             [
                 self.server_on_cart_x,

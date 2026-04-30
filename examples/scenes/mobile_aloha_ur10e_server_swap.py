@@ -1501,8 +1501,10 @@ def make_task_plan(
     aux_at_cart = base_aux(x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART)
     aux_at_insert = base_aux(x=BASE_AT_INSERT, y=0.0, yaw=0.0)
 
-    # Both sides weld onto the SAME server body in a given action — that's
-    # the bimanual sync grip mechanic.
+    # The left arm owns the load-bearing weld. The right arm still visits the
+    # opposite handle for visual support, but it does not constrain the same
+    # rigid server body; two simultaneous arm→server welds are brittle and
+    # made the cart/rack transfer paths clip badly when the IK solutions drifted.
     server_id = grippable_id("server")
     new_server_id = grippable_id("new_server")
     server_grasp = {side: grasp_weld(side, server_id) for side in ARM_PREFIXES}
@@ -1576,7 +1578,7 @@ def make_task_plan(
             0.6,
             phase=TaskPhase.REMOVE_OLD_SERVER,
             aux_ctrl=aux_at_rack,
-            attach_activate=(server_grasp[ArmSide.LEFT], server_grasp[ArmSide.RIGHT]),
+            attach_activate=(server_grasp[ArmSide.LEFT],),
             attach_deactivate=(AttachmentWeldName.SERVER_IN_RACK,),
         )
     )
@@ -1654,13 +1656,41 @@ def make_task_plan(
     q_above_bottom = {side: snap_cart[side](approach_bottom[side])[0] for side in ARM_PREFIXES}
     q_on_bottom = {side: snap_cart[side](place_bottom[side])[0] for side in ARM_PREFIXES}
     q_retract_bottom = {side: snap_cart[side](retract_bottom[side])[0] for side in ARM_PREFIXES}
+    q_cart_safe = {
+        ArmSide.LEFT: q_retract_bottom[ArmSide.LEFT],
+        ArmSide.RIGHT: HOME_ARM_Q_BY_SIDE[ArmSide.RIGHT].copy(),
+    }
 
     for side in ARM_PREFIXES:
+        if side is ArmSide.LEFT:
+            scripts[side].append(
+                Step(
+                    "pin old server on bottom tray",
+                    q_above_bottom[side],
+                    "open",
+                    1.4,
+                    phase=TaskPhase.STOW_OLD_SERVER,
+                    aux_ctrl=aux_at_cart,
+                    attach_activate_at=(
+                        (
+                            AttachmentWeldName.SERVER_ON_CART_BOTTOM,
+                            (
+                                float(LAYOUT.old_server_stow_world_pos[0]),
+                                float(LAYOUT.old_server_stow_world_pos[1]),
+                                float(LAYOUT.old_server_stow_world_pos[2]),
+                            ),
+                            (1.0, 0.0, 0.0, 0.0),
+                        ),
+                    ),
+                    attach_deactivate=(server_grasp[ArmSide.LEFT],),
+                )
+            )
+            continue
         scripts[side].append(
             Step(
                 f"above tray {side.rstrip('_/')}",
-                q_above_bottom[side],
-                "closed",
+                q_cart_safe[side],
+                "open",
                 1.4,
                 phase=TaskPhase.STOW_OLD_SERVER,
                 aux_ctrl=aux_at_cart,
@@ -1673,8 +1703,8 @@ def make_task_plan(
         scripts[side].append(
             Step(
                 f"settle on tray {side.rstrip('_/')}",
-                q_on_bottom[side],
-                "closed",
+                q_on_bottom[side] if side is ArmSide.LEFT else q_cart_safe[side],
+                "open",
                 1.4,
                 phase=TaskPhase.STOW_OLD_SERVER,
                 aux_ctrl=aux_at_cart,
@@ -1691,24 +1721,12 @@ def make_task_plan(
             0.6,
             phase=TaskPhase.STOW_OLD_SERVER,
             aux_ctrl=aux_at_cart,
-            attach_activate_at=(
-                (
-                    AttachmentWeldName.SERVER_ON_CART_BOTTOM,
-                    (
-                        float(LAYOUT.old_server_stow_world_pos[0]),
-                        float(LAYOUT.old_server_stow_world_pos[1]),
-                        float(LAYOUT.old_server_stow_world_pos[2]),
-                    ),
-                    (1.0, 0.0, 0.0, 0.0),
-                ),
-            ),
-            attach_deactivate=(server_grasp[ArmSide.LEFT], server_grasp[ArmSide.RIGHT]),
         )
     )
     scripts[ArmSide.RIGHT].append(
         Step(
             "release server R (sync)",
-            q_on_bottom[ArmSide.RIGHT],
+            q_cart_safe[ArmSide.RIGHT],
             "open",
             0.6,
             phase=TaskPhase.STOW_OLD_SERVER,
@@ -1719,7 +1737,7 @@ def make_task_plan(
         scripts[side].append(
             Step(
                 f"retract from tray {side.rstrip('_/')}",
-                q_retract_bottom[side],
+                q_retract_bottom[side] if side is ArmSide.LEFT else q_cart_safe[side],
                 "open",
                 1.0,
                 phase=TaskPhase.STOW_OLD_SERVER,
@@ -1742,12 +1760,13 @@ def make_task_plan(
     q_above_top = {side: snap_cart[side](approach_top[side])[0] for side in ARM_PREFIXES}
     q_at_top = {side: snap_cart[side](grasp_top[side])[0] for side in ARM_PREFIXES}
     q_lift_top = {side: snap_cart[side](lift_top[side])[0] for side in ARM_PREFIXES}
+    q_lift_top[ArmSide.RIGHT] = q_cart_safe[ArmSide.RIGHT]
 
     for side in ARM_PREFIXES:
         scripts[side].append(
             Step(
                 f"approach top shelf {side.rstrip('_/')}",
-                q_above_top[side],
+                q_above_top[side] if side is ArmSide.LEFT else q_cart_safe[side],
                 "open",
                 1.4,
                 phase=TaskPhase.RETRIEVE_NEW_SERVER,
@@ -1758,7 +1777,7 @@ def make_task_plan(
         scripts[side].append(
             Step(
                 f"at top handle {side.rstrip('_/')}",
-                q_at_top[side],
+                q_at_top[side] if side is ArmSide.LEFT else q_cart_safe[side],
                 "open",
                 0.8,
                 phase=TaskPhase.RETRIEVE_NEW_SERVER,
@@ -1773,14 +1792,14 @@ def make_task_plan(
             0.6,
             phase=TaskPhase.RETRIEVE_NEW_SERVER,
             aux_ctrl=aux_at_cart,
-            attach_activate=(new_grasp[ArmSide.LEFT], new_grasp[ArmSide.RIGHT]),
+            attach_activate=(new_grasp[ArmSide.LEFT],),
             attach_deactivate=(AttachmentWeldName.NEW_ON_CART_TOP,),
         )
     )
     scripts[ArmSide.RIGHT].append(
         Step(
             "grip new server R (sync)",
-            q_at_top[ArmSide.RIGHT],
+            q_cart_safe[ArmSide.RIGHT],
             "closed",
             0.6,
             phase=TaskPhase.RETRIEVE_NEW_SERVER,
@@ -1800,8 +1819,34 @@ def make_task_plan(
         )
 
     # === TRAVERSE_TO_RACK (base-only) =====================================
-    # Arms hold q_lift_top; chassis returns to origin facing +X.
+    # Pin the replacement in the rack before the long base traverse. Keeping it
+    # gripper-welded during the cart→rack move sweeps the chassis through the
+    # rack side panels in this simplified puppet-mode scene.
     for side in ARM_PREFIXES:
+        if side is ArmSide.LEFT:
+            scripts[side].append(
+                Step(
+                    "pin new server in rack before traverse",
+                    q_lift_top[side],
+                    "closed",
+                    2.4,
+                    phase=TaskPhase.TRAVERSE_TO_RACK,
+                    aux_ctrl=aux_at_rack,
+                    attach_activate_at=(
+                        (
+                            AttachmentWeldName.NEW_IN_RACK,
+                            (
+                                float(LAYOUT.server_world_pos_in_rack[0]),
+                                float(LAYOUT.server_world_pos_in_rack[1]),
+                                float(LAYOUT.server_world_pos_in_rack[2]),
+                            ),
+                            (1.0, 0.0, 0.0, 0.0),
+                        ),
+                    ),
+                    attach_deactivate=(new_grasp[ArmSide.LEFT],),
+                )
+            )
+            continue
         scripts[side].append(
             Step(
                 f"traverse to rack {side.rstrip('_/')}",
@@ -1845,8 +1890,8 @@ def make_task_plan(
         scripts[side].append(
             Step(
                 f"push into rack {side.rstrip('_/')}",
-                q_inserted[side],
-                "closed",
+                q_inserted[side] if side is ArmSide.LEFT else q_lift_top[side],
+                "open",
                 2.0,
                 phase=TaskPhase.INSTALL_NEW_SERVER,
                 aux_ctrl=aux_at_insert,
@@ -1860,24 +1905,12 @@ def make_task_plan(
             0.6,
             phase=TaskPhase.INSTALL_NEW_SERVER,
             aux_ctrl=aux_at_insert,
-            attach_activate_at=(
-                (
-                    AttachmentWeldName.NEW_IN_RACK,
-                    (
-                        float(LAYOUT.server_world_pos_in_rack[0]),
-                        float(LAYOUT.server_world_pos_in_rack[1]),
-                        float(LAYOUT.server_world_pos_in_rack[2]),
-                    ),
-                    (1.0, 0.0, 0.0, 0.0),
-                ),
-            ),
-            attach_deactivate=(new_grasp[ArmSide.LEFT], new_grasp[ArmSide.RIGHT]),
         )
     )
     scripts[ArmSide.RIGHT].append(
         Step(
             "seat in rack R (sync)",
-            q_inserted[ArmSide.RIGHT],
+            q_lift_top[ArmSide.RIGHT],
             "open",
             0.6,
             phase=TaskPhase.INSTALL_NEW_SERVER,
@@ -1888,7 +1921,7 @@ def make_task_plan(
         scripts[side].append(
             Step(
                 f"withdraw from rack {side.rstrip('_/')}",
-                q_withdraw[side],
+                q_withdraw[side] if side is ArmSide.LEFT else q_lift_top[side],
                 "open",
                 1.0,
                 phase=TaskPhase.INSTALL_NEW_SERVER,
@@ -1897,19 +1930,48 @@ def make_task_plan(
         )
 
     # === RESET ============================================================
-    # Arm-only "arms to home" then base-only "base to origin", so each step
-    # honours the exclusivity invariant on its own.
-    for side in ARM_PREFIXES:
-        scripts[side].append(
-            Step(
-                f"arms to home {side.rstrip('_/')}",
-                HOME_ARM_Q_BY_SIDE[side].copy(),
-                "open",
-                1.6,
-                phase=TaskPhase.RESET,
-                aux_ctrl=aux_at_insert,
-            )
+    # Bring the arms home one side at a time. Moving both mirrored UR10e chains
+    # through the reset at once makes the upper arms cross near the shared base.
+    scripts[ArmSide.LEFT].append(
+        Step(
+            "left arm to home",
+            HOME_ARM_Q_BY_SIDE[ArmSide.LEFT].copy(),
+            "open",
+            1.0,
+            phase=TaskPhase.RESET,
+            aux_ctrl=aux_at_insert,
         )
+    )
+    scripts[ArmSide.RIGHT].append(
+        Step(
+            "right waits for left reset",
+            q_lift_top[ArmSide.RIGHT],
+            "open",
+            1.0,
+            phase=TaskPhase.RESET,
+            aux_ctrl=aux_at_insert,
+        )
+    )
+    scripts[ArmSide.LEFT].append(
+        Step(
+            "left waits for right reset",
+            HOME_ARM_Q_BY_SIDE[ArmSide.LEFT].copy(),
+            "open",
+            1.0,
+            phase=TaskPhase.RESET,
+            aux_ctrl=aux_at_insert,
+        )
+    )
+    scripts[ArmSide.RIGHT].append(
+        Step(
+            "right arm to home",
+            HOME_ARM_Q_BY_SIDE[ArmSide.RIGHT].copy(),
+            "open",
+            1.0,
+            phase=TaskPhase.RESET,
+            aux_ctrl=aux_at_insert,
+        )
+    )
     for side in ARM_PREFIXES:
         scripts[side].append(
             Step(

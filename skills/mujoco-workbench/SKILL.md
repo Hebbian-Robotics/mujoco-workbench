@@ -28,8 +28,8 @@ the examples/package split.
 
 Use the focused skills when relevant:
 
-- `mujoco-run-debug`: running scenes, rendering snapshots/grids, video export, Rerun, and artifact-producing debug commands.
-- `mujoco-scene-authoring`: adding or editing scene modules, robot loaders, and example assets.
+- `mujoco-run-debug`: running scenes, rendering snapshots/grids, clearance checks, video export, Rerun, and artifact-producing debug commands.
+- `mujoco-scene-authoring`: adding or editing scene modules, robot loaders, example assets, and collision-free object/waypoint spacing.
 - `mujoco-phase-contracts`: updating phase contracts, invariants, observability checks, and contract failure debugging.
 
 Always run the repository checks after code changes:
@@ -40,4 +40,3 @@ uv run ruff format
 uv run ty check
 uv run pytest
 ```
-

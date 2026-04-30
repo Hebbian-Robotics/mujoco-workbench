@@ -31,7 +31,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 # Pick a safe MuJoCo GL backend before importing mujoco. Linux EC2 needs
 # EGL for headless rendering; macOS rejects `egl`, so use GLFW there.
@@ -132,6 +132,39 @@ class PhaseWindow:
     @property
     def duration_s(self) -> float:
         return self.end_s - self.start_s
+
+
+ClearanceGroup = Literal["left_arm", "right_arm", "grippable", "static", "other_dynamic"]
+
+
+@dataclass(frozen=True)
+class ClearanceGeom:
+    """Compiled geom metadata used by the timeline clearance checker."""
+
+    geom_id: int
+    geom_name: str
+    body_id: int
+    body_name: str
+    group: ClearanceGroup
+
+
+@dataclass(frozen=True)
+class ClearanceAabb:
+    """World-space AABB for one geom at the current simulation state."""
+
+    min_xyz: np.ndarray
+    max_xyz: np.ndarray
+
+
+@dataclass(frozen=True)
+class ClearanceFinding:
+    """Worst observed clearance for one geom pair over a replayed timeline."""
+
+    time_s: float
+    distance_m: float
+    geom_a: ClearanceGeom
+    geom_b: ClearanceGeom
+    active_steps: str
 
 
 def _aux_name_to_id(ctx: SceneContext) -> dict[str, int]:
@@ -261,6 +294,213 @@ def _advance_context(
     )
     mujoco.mj_forward(ctx.model, ctx.data)
     return actual_timeline_state
+
+
+def _body_or_ancestor_has_name(model: mujoco.MjModel, body_id: int, body_name: str) -> bool:
+    current_body_id = body_id
+    while current_body_id > 0:
+        current_name = (
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, current_body_id)
+            or f"b{current_body_id}"
+        )
+        if current_name == body_name or current_name.startswith(f"{body_name}/"):
+            return True
+        current_body_id = int(model.body_parentid[current_body_id])
+    return False
+
+
+def _body_is_ancestor(model: mujoco.MjModel, ancestor_body_id: int, body_id: int) -> bool:
+    current_body_id = body_id
+    while current_body_id > 0:
+        current_body_id = int(model.body_parentid[current_body_id])
+        if current_body_id == ancestor_body_id:
+            return True
+    return False
+
+
+def _classify_clearance_geom(
+    ctx: SceneContext,
+    *,
+    geom_id: int,
+    body_id: int,
+    geom_name: str,
+    body_name: str,
+) -> ClearanceGroup:
+    if geom_name.startswith("left/") or body_name.startswith("left/"):
+        return "left_arm"
+    if geom_name.startswith("right/") or body_name.startswith("right/"):
+        return "right_arm"
+    if any(
+        _body_or_ancestor_has_name(ctx.model, body_id, name) for name in ctx.scene.grippable_names
+    ):
+        return "grippable"
+    if int(ctx.model.body_weldid[body_id]) == 0:
+        return "static"
+    return "other_dynamic"
+
+
+def _collect_clearance_geoms(ctx: SceneContext) -> list[ClearanceGeom]:
+    geoms: list[ClearanceGeom] = []
+    for geom_id in range(ctx.model.ngeom):
+        if int(ctx.model.geom_type[geom_id]) == mujoco.mjtGeom.mjGEOM_PLANE:
+            continue
+        geom_name = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or f"g{geom_id}"
+        body_id = int(ctx.model.geom_bodyid[geom_id])
+        body_name = mujoco.mj_id2name(ctx.model, mujoco.mjtObj.mjOBJ_BODY, body_id) or f"b{body_id}"
+        group = _classify_clearance_geom(
+            ctx,
+            geom_id=geom_id,
+            body_id=body_id,
+            geom_name=geom_name,
+            body_name=body_name,
+        )
+        geoms.append(
+            ClearanceGeom(
+                geom_id=geom_id,
+                geom_name=geom_name,
+                body_id=body_id,
+                body_name=body_name,
+                group=group,
+            )
+        )
+    return geoms
+
+
+def _clearance_pair_is_interesting(
+    ctx: SceneContext,
+    geom_a: ClearanceGeom,
+    geom_b: ClearanceGeom,
+    allowed_static_overlap_names: set[frozenset[str]],
+) -> bool:
+    if geom_a.body_id == geom_b.body_id:
+        return False
+    if _body_is_ancestor(ctx.model, geom_a.body_id, geom_b.body_id):
+        return False
+    if _body_is_ancestor(ctx.model, geom_b.body_id, geom_a.body_id):
+        return False
+
+    names_a = {geom_a.geom_name, geom_a.body_name}
+    names_b = {geom_b.geom_name, geom_b.body_name}
+    if any(
+        frozenset((name_a, name_b)) in allowed_static_overlap_names
+        for name_a in names_a
+        for name_b in names_b
+    ):
+        return False
+
+    groups = frozenset((geom_a.group, geom_b.group))
+    return groups in {
+        frozenset(("left_arm", "right_arm")),
+        frozenset(("left_arm", "static")),
+        frozenset(("right_arm", "static")),
+        frozenset(("left_arm", "grippable")),
+        frozenset(("right_arm", "grippable")),
+        frozenset(("grippable", "static")),
+    }
+
+
+def _clearance_aabb_for_geom(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_id: int,
+) -> ClearanceAabb:
+    xpos = np.asarray(data.geom_xpos[geom_id], dtype=float)
+    xmat = np.asarray(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    geom_type = int(model.geom_type[geom_id])
+    geom_size = np.asarray(model.geom_size[geom_id], dtype=float)
+    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+        radius = float(model.geom_rbound[geom_id])
+        half_world = np.array([radius, radius, radius], dtype=float)
+    elif geom_type == mujoco.mjtGeom.mjGEOM_BOX or geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+        half_world = np.abs(xmat) @ geom_size
+    elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+        radius = float(geom_size[0])
+        half_world = np.array([radius, radius, radius], dtype=float)
+    elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER or geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+        radius = float(geom_size[0])
+        half_length = float(geom_size[1])
+        local_half = np.array([radius, radius, half_length + radius], dtype=float)
+        half_world = np.abs(xmat) @ local_half
+    else:
+        half_world = np.zeros(3, dtype=float)
+    return ClearanceAabb(min_xyz=xpos - half_world, max_xyz=xpos + half_world)
+
+
+def _aabb_signed_distance(aabb_a: ClearanceAabb, aabb_b: ClearanceAabb) -> float:
+    separation = np.maximum(aabb_a.min_xyz - aabb_b.max_xyz, aabb_b.min_xyz - aabb_a.max_xyz)
+    positive_separation = np.maximum(separation, 0.0)
+    if np.any(positive_separation > 0.0):
+        return float(np.linalg.norm(positive_separation))
+    penetration_depth_by_axis = np.minimum(aabb_a.max_xyz, aabb_b.max_xyz) - np.maximum(
+        aabb_a.min_xyz, aabb_b.min_xyz
+    )
+    return -float(np.min(penetration_depth_by_axis))
+
+
+def _geom_signed_distance(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_a_id: int,
+    geom_b_id: int,
+    *,
+    max_distance_m: float,
+) -> float:
+    fromto = np.zeros(6, dtype=np.float64)
+    try:
+        return float(
+            mujoco.mj_geomDistance(model, data, geom_a_id, geom_b_id, max_distance_m, fromto)
+        )
+    except Exception:
+        aabb_a = _clearance_aabb_for_geom(model, data, geom_a_id)
+        aabb_b = _clearance_aabb_for_geom(model, data, geom_b_id)
+        return _aabb_signed_distance(aabb_a, aabb_b)
+
+
+def _clearance_aabb_arrays_for_geoms(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geoms: list[ClearanceGeom],
+) -> tuple[np.ndarray, np.ndarray]:
+    min_xyz_by_geom = np.zeros((model.ngeom, 3), dtype=float)
+    max_xyz_by_geom = np.zeros((model.ngeom, 3), dtype=float)
+    for geom in geoms:
+        aabb = _clearance_aabb_for_geom(model, data, geom.geom_id)
+        min_xyz_by_geom[geom.geom_id] = aabb.min_xyz
+        max_xyz_by_geom[geom.geom_id] = aabb.max_xyz
+    return min_xyz_by_geom, max_xyz_by_geom
+
+
+def _aabb_distances_for_pairs(
+    min_xyz_by_geom: np.ndarray,
+    max_xyz_by_geom: np.ndarray,
+    pair_geom_a_ids: np.ndarray,
+    pair_geom_b_ids: np.ndarray,
+) -> np.ndarray:
+    min_a = min_xyz_by_geom[pair_geom_a_ids]
+    max_a = max_xyz_by_geom[pair_geom_a_ids]
+    min_b = min_xyz_by_geom[pair_geom_b_ids]
+    max_b = max_xyz_by_geom[pair_geom_b_ids]
+    separation = np.maximum(min_a - max_b, min_b - max_a)
+    positive_separation = np.maximum(separation, 0.0)
+    separated = np.any(positive_separation > 0.0, axis=1)
+    distances = np.linalg.norm(positive_separation, axis=1)
+    penetration_depth_by_axis = np.minimum(max_a, max_b) - np.maximum(min_a, min_b)
+    distances[~separated] = -np.min(penetration_depth_by_axis[~separated], axis=1)
+    return distances
+
+
+def _active_step_labels(task_plan: Mapping[Any, list[Step]], time_s: float) -> str:
+    labels: list[str] = []
+    for side, script in task_plan.items():
+        elapsed = 0.0
+        for step in script:
+            step_start = elapsed
+            step_end = elapsed + step.duration
+            if step_start - 1e-9 <= time_s <= step_end + 1e-9:
+                labels.append(f"{side}:{step.phase.value}:{step.label}")
+                break
+            elapsed = step_end
+    return " | ".join(labels) if labels else "-"
 
 
 def _record_phase_boundary(
@@ -659,6 +899,149 @@ def surface_point(
     typer.echo(f"aabb_max={_format_xyz(aabb.max_xyz)}")
     typer.echo(f"normal={_format_xyz(outward_normal)}")
     typer.echo(f"surface_point={_format_xyz(point)}")
+
+
+# ---- timeline clearance ------------------------------------------------------
+
+
+@app.command("clearance")
+def clearance(
+    scene: SceneOpt = DEFAULT_SCENE,
+    sample_dt: Annotated[
+        float,
+        typer.Option("--sample-dt", help="seconds between timeline samples"),
+    ] = 0.05,
+    max_distance: Annotated[
+        float,
+        typer.Option("--max-distance", help="distance threshold to report, in metres"),
+    ] = 0.02,
+    fail_below: Annotated[
+        float,
+        typer.Option("--fail-below", help="exit non-zero if any reported pair is below this"),
+    ] = -math.inf,
+    exact_geom: Annotated[
+        bool,
+        typer.Option(
+            "--exact-geom/--aabb-only",
+            help="use MuJoCo geom distance after the AABB broadphase",
+        ),
+    ] = False,
+    top: Annotated[int, typer.Option("--top", help="number of worst geom pairs to print")] = 25,
+) -> None:
+    """Replay a scripted scene and report arm/object clearance problems."""
+    if sample_dt <= 0.0:
+        raise typer.BadParameter("--sample-dt must be positive")
+    if max_distance < 0.0:
+        raise typer.BadParameter("--max-distance must be non-negative")
+    if top <= 0:
+        raise typer.BadParameter("--top must be positive")
+
+    ctx = build_scene_and_advance(scene, Seconds(0.0))
+    if ctx.task_plan is None:
+        raise typer.BadParameter(f"scene {scene!r} has no make_task_plan")
+
+    allowed_static_overlap_names = {
+        frozenset((str(left_name), str(right_name)))
+        for left_name, right_name in ctx.scene.allowed_static_overlaps
+    }
+    geoms = _collect_clearance_geoms(ctx)
+    candidate_pairs = [
+        (geom_a, geom_b)
+        for index, geom_a in enumerate(geoms)
+        for geom_b in geoms[index + 1 :]
+        if _clearance_pair_is_interesting(ctx, geom_a, geom_b, allowed_static_overlap_names)
+    ]
+    if not candidate_pairs:
+        typer.echo("no candidate geom pairs")
+        return
+    candidate_geoms_by_id = {geom.geom_id: geom for pair in candidate_pairs for geom in pair}
+    pair_geom_a_ids = np.asarray([pair[0].geom_id for pair in candidate_pairs], dtype=np.int32)
+    pair_geom_b_ids = np.asarray([pair[1].geom_id for pair in candidate_pairs], dtype=np.int32)
+
+    duration_s = max(sum(step.duration for step in script) for script in ctx.task_plan.values())
+    timeline_state = make_timeline_state(ctx.data, ctx.arms)
+    current_time_s = 0.0
+    worst_by_pair: dict[tuple[int, int], ClearanceFinding] = {}
+    sample_count = 0
+
+    while current_time_s <= duration_s + 1e-9:
+        active_steps = _active_step_labels(ctx.task_plan, current_time_s)
+        min_xyz_by_geom, max_xyz_by_geom = _clearance_aabb_arrays_for_geoms(
+            ctx.model,
+            ctx.data,
+            list(candidate_geoms_by_id.values()),
+        )
+        aabb_distances = _aabb_distances_for_pairs(
+            min_xyz_by_geom,
+            max_xyz_by_geom,
+            pair_geom_a_ids,
+            pair_geom_b_ids,
+        )
+        nearby_pair_indices = np.flatnonzero(aabb_distances <= max_distance)
+        for pair_index in nearby_pair_indices:
+            pair_key = (
+                int(pair_geom_a_ids[pair_index]),
+                int(pair_geom_b_ids[pair_index]),
+            )
+            geom_a, geom_b = candidate_pairs[int(pair_index)]
+            distance_m = float(aabb_distances[pair_index])
+            if exact_geom:
+                distance_m = _geom_signed_distance(
+                    ctx.model,
+                    ctx.data,
+                    geom_a.geom_id,
+                    geom_b.geom_id,
+                    max_distance_m=max_distance,
+                )
+            if distance_m > max_distance:
+                continue
+            previous = worst_by_pair.get(pair_key)
+            if previous is None or distance_m < previous.distance_m:
+                worst_by_pair[pair_key] = ClearanceFinding(
+                    time_s=current_time_s,
+                    distance_m=distance_m,
+                    geom_a=geom_a,
+                    geom_b=geom_b,
+                    active_steps=active_steps,
+                )
+
+        sample_count += 1
+        next_time_s = min(current_time_s + sample_dt, duration_s)
+        if next_time_s <= current_time_s + 1e-9:
+            break
+        timeline_state = _advance_context(ctx, next_time_s - current_time_s, timeline_state)
+        current_time_s = next_time_s
+
+    findings = sorted(worst_by_pair.values(), key=lambda finding: finding.distance_m)
+    typer.echo(
+        f"sampled {sample_count} frames over {duration_s:.2f}s; "
+        f"{len(candidate_pairs)} candidate pairs; "
+        f"{len(findings)} pairs <= {max_distance * 1000:.1f}mm"
+    )
+    if not findings:
+        return
+
+    header = (
+        f"{'dist_mm':>9} {'time_s':>7} {'groups':<22} "
+        f"{'body_a':<28} {'geom_a':<32} {'body_b':<28} {'geom_b':<32} active_steps"
+    )
+    typer.echo(header)
+    typer.echo("-" * len(header))
+    for finding in findings[:top]:
+        groups = f"{finding.geom_a.group}/{finding.geom_b.group}"
+        typer.echo(
+            f"{finding.distance_m * 1000:>9.2f} "
+            f"{finding.time_s:>7.2f} "
+            f"{groups:<22} "
+            f"{finding.geom_a.body_name:<28.28} "
+            f"{finding.geom_a.geom_name:<32.32} "
+            f"{finding.geom_b.body_name:<28.28} "
+            f"{finding.geom_b.geom_name:<32.32} "
+            f"{finding.active_steps}"
+        )
+
+    if findings[0].distance_m < fail_below:
+        raise typer.Exit(code=1)
 
 
 # ---- plan --------------------------------------------------------------------

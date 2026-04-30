@@ -90,6 +90,30 @@ robot's nose/swept-corner extents. Keep yaw-in-place and final approach as
 separate base-only steps when rotation would otherwise clip into nearby static
 geometry.
 
+## Clearance Pattern
+
+When a scene clips, prefer moving geometry and waypoints farther apart before
+micro-tuning joints. Give the robot base enough stand-off from racks/carts,
+increase object lift/standoff distances, and keep helper arms parked away from
+the load-bearing arm unless they are actively needed.
+
+Run clearance after placement or task-plan edits:
+
+```bash
+uv run mwb debug clearance \
+  --scene examples.scenes.mobile_aloha_piper_indicator_check \
+  --sample-dt 0.50 \
+  --max-distance 0.005 \
+  --exact-geom \
+  --top 12
+```
+
+Read the reported `active_steps` first. Fix the largest real penetrations by
+phase: widen object spacing, split long carries into approach/at/lift/clear
+steps, pin or release objects before unsafe base/lift transitions, and park the
+non-load-bearing arm. Re-run `clearance` and `contracts`; the indicator-check
+scene is allowed to report intentional contact at the light/server face.
+
 Use fully qualified scene modules in commands:
 
 ```bash

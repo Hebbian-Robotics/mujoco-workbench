@@ -1640,17 +1640,16 @@ def make_task_plan(
             # Rotate body in place to face cart (yaw 0 → -π/2). Arm pose
             # held; server rotates with the robot.
             Step("rotate to cart", qL_out, "closed", 2.5, aux_ctrl=aux_facing_cart),
-            # Slide diagonally toward cart (base x: 0 → 0.25, y: 0 → -0.35).
-            Step("slide to cart", qL_out, "closed", 2.0, aux_ctrl=aux_at_cart),
-            # Drop the lift to descend the server onto the cart's bottom shelf.
-            Step("lower onto cart", qL_out, "closed", 1.5, aux_ctrl=aux_at_cart_low),
-            # Release: pin server at canonical cart-shelf pose; drop grasp.
+            # Pin at the start of the cart transfer. Dragging the
+            # gripper-welded server through the base slide made the server pass
+            # through the cart shelf; the object belongs at the canonical cart
+            # pose before the robot starts clearing out.
             Step(
-                "release on cart L",
+                "slide to cart and pin server L",
                 qL_out,
                 "open",
-                0.8,
-                aux_ctrl=aux_at_cart_low,
+                2.0,
+                aux_ctrl=aux_at_cart,
                 attach_activate_at=(
                     (
                         AttachmentWeldName.SERVER_ON_CART_BOTTOM,
@@ -1663,6 +1662,14 @@ def make_task_plan(
                     ),
                 ),
                 attach_deactivate=(grasp_L,),
+            ),
+            Step("clear cart after stow L", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_cart),
+            Step(
+                "lower lift after stow L",
+                HOME_ARM_Q.copy(),
+                "open",
+                1.5,
+                aux_ctrl=aux_at_cart_low,
             ),
         ]
     )
@@ -1680,9 +1687,15 @@ def make_task_plan(
             Step("hold handle R", qR_at, "open", 0.6, aux_ctrl=aux_pre_extract),
             Step("pull server out R", qR_out, "open", 2.8, aux_ctrl=aux_pre_extract),
             Step("rotate R", qR_out, "open", 2.5, aux_ctrl=aux_facing_cart),
-            Step("slide to cart R", qR_out, "open", 2.0, aux_ctrl=aux_at_cart),
-            Step("lower onto cart R", qR_out, "open", 1.5, aux_ctrl=aux_at_cart_low),
-            Step("release R", qR_out, "open", 0.8, aux_ctrl=aux_at_cart_low),
+            Step("slide to cart R", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_at_cart),
+            Step("clear cart after stow R", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_cart),
+            Step(
+                "lower lift after stow R",
+                HOME_ARM_Q.copy(),
+                "open",
+                1.5,
+                aux_ctrl=aux_at_cart_low,
+            ),
         ]
     )
 
@@ -1767,7 +1780,8 @@ def make_task_plan(
             # Rotate back to face rack.
             Step("rotate to rack L", qL_ngrip, "closed", 2.5, aux_ctrl=aux_carry_back),
             # Re-pose arm to "out" — server now held in front of robot,
-            # ready to slide into the rack. Mirror of post-extract pose.
+            # ready to be seated. Pin before the visual slide so the server
+            # does not sweep through rack panels during the base/arm transition.
             Step(
                 "ready to insert L",
                 qL_out,
@@ -1775,23 +1789,12 @@ def make_task_plan(
                 1.5,
                 aux_ctrl=aux_carry_back,
             ),
-            # ARM-EXTEND slide-in: TCP traces a horizontal line at constant
-            # z=slot_z, moving from "out" (-x) to "at handle" (+x). Server
-            # slides into the rack slot — exact reverse of extract pull.
-            Step("slide into rack L", qL_at, "closed", 2.0, aux_ctrl=aux_carry_back),
-            # Robot rolls forward to base origin so the slot/server pose
-            # matches the canonical world position before the weld pins.
-            Step("roll forward L", qL_at, "closed", 1.0, aux_ctrl=aux_at_rack),
-            # Release: pin new_server at canonical rack pose, drop grasp.
-            # Arm stays at qL_at (TCP at handle) — server is already in
-            # the slot from the slide-in step; the weld just snaps the
-            # canonical pose and we drop the grasp.
             Step(
-                "seat in rack L",
-                qL_at,
+                "pin new server in rack L",
+                qL_out,
                 "open",
-                0.8,
-                aux_ctrl=aux_at_rack,
+                0.4,
+                aux_ctrl=aux_carry_back,
                 attach_activate_at=(
                     (
                         AttachmentWeldName.NEW_IN_RACK,
@@ -1805,6 +1808,20 @@ def make_task_plan(
                 ),
                 attach_deactivate=(grasp_new_L,),
             ),
+            # ARM-EXTEND slide-in: TCP traces a horizontal line at constant
+            # z=slot_z, moving from "out" (-x) to "at handle" (+x). Server
+            # is already pinned in the rack; this is now a visual follow-through.
+            Step("slide into rack L", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_carry_back),
+            # Robot rolls forward to base origin so the slot/server pose
+            # matches the canonical world position before the weld pins.
+            Step("roll forward L", HOME_ARM_Q.copy(), "open", 1.0, aux_ctrl=aux_at_rack),
+            Step(
+                "seat in rack L",
+                HOME_ARM_Q.copy(),
+                "open",
+                0.8,
+                aux_ctrl=aux_at_rack,
+            ),
         ]
     )
     scripts[ArmSide.RIGHT].extend(
@@ -1816,9 +1833,10 @@ def make_task_plan(
             Step("slide back R2", qR_ngrip, "open", 2.0, aux_ctrl=aux_carry_facing_cart),
             Step("rotate to rack R", qR_ngrip, "open", 2.5, aux_ctrl=aux_carry_back),
             Step("ready to insert R", qR_out, "open", 1.5, aux_ctrl=aux_carry_back),
-            Step("slide into rack R", qR_at, "open", 2.0, aux_ctrl=aux_carry_back),
-            Step("roll forward R", qR_at, "open", 1.0, aux_ctrl=aux_at_rack),
-            Step("seat in rack R", qR_at, "open", 0.8, aux_ctrl=aux_at_rack),
+            Step("pin new server in rack R", qR_out, "open", 0.4, aux_ctrl=aux_carry_back),
+            Step("slide into rack R", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_carry_back),
+            Step("roll forward R", HOME_ARM_Q.copy(), "open", 1.0, aux_ctrl=aux_at_rack),
+            Step("seat in rack R", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_rack),
         ]
     )
 
