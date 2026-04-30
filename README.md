@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/af5a213e-7783-4ee4-82b9-29833cae0406
 
-A prototyping tool that lets you define robot behaviors visually in MuJoCo simulation, so your team is aligned on the desired behavior of your robot trajectory before writing a single training loop.
+Prototype robot behaviors in MuJoCo with coding agents like Codex and Claude Code, so your team can collaborate visually on the trajectory before anyone writes a training loop.
 
 **How it works:** install the bundled Agent skills, describe what you want, and the agent scaffolds a working sim for you. No MuJoCo experience required to get started. The skills teach the agent the `mwb` CLI, the scene layout conventions, and the debug tools so it can iterate on behavior without you needing to know the plumbing.
 
