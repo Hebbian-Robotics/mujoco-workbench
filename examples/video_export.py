@@ -43,6 +43,7 @@ from mujoco_workbench.runtime import (
     advance_timeline_with_state,
     build_scene_and_advance,
     make_timeline_state,
+    resolve_timeline_actuator_maps,
 )
 
 SCENE = "examples.scenes.mobile_aloha_piper_indicator_check"
@@ -215,10 +216,7 @@ def main(
     )
 
     sim_dt = float(ctx.model.opt.timestep)
-    aux_name_to_id = {
-        n: mujoco.mj_name2id(ctx.model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
-        for n in ctx.scene.aux_actuator_names
-    }
+    timeline_actuators = resolve_timeline_actuator_maps(ctx.model, ctx.scene)
 
     fixed_cam_specs = (
         ("forward.mp4", "forward_cam"),
@@ -310,7 +308,13 @@ def main(
                     ctx.arms,
                     ctx.task_plan,
                     state,
-                    aux_name_to_id,
+                    timeline_actuators.base_name_to_id,
+                    timeline_actuators.base_qposadr,
+                    timeline_actuators.base_dofadr,
+                    timeline_actuators.lift_name_to_id,
+                    timeline_actuators.lift_qposadr,
+                    timeline_actuators.lift_dofadr,
+                    timeline_actuators.aux_name_to_id,
                     ctx.cube_body_ids,
                     sim_dt,
                     Seconds(delta_steps * sim_dt),

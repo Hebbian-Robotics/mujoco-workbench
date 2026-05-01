@@ -194,7 +194,7 @@ def load_mobile_aloha() -> mjcf.RootElement:
     return root
 
 
-# --- Aux-actuator names exposed for the scene module's DataCenterAux --
+# --- Base actuator names exposed for scene-level BASE_ACTUATOR_NAMES --
 BASE_X_JOINT_NAME = "base_x"
 BASE_Y_JOINT_NAME = "base_y"
 BASE_YAW_JOINT_NAME = "base_yaw"

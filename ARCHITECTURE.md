@@ -61,17 +61,23 @@ contract:
 ```python
 import mujoco
 
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide
+from mujoco_workbench.arm_handles import ArmHandles, ArmSide, ManipulatorSpec, RobotKind
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.scene_base import Step
 
 NAME = "my_scene"
 ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+MANIPULATORS = (
+    ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.PIPER),
+    ManipulatorSpec(side=ArmSide.RIGHT, robot_kind=RobotKind.PIPER),
+)
 N_CUBES = 0
 
 GRIPPABLES: tuple[str, ...] = ()
 CAMERAS: tuple[tuple[str, CameraRole], ...] = ()
 AUX_ACTUATOR_NAMES: tuple[str, ...] = ()
+BASE_ACTUATOR_NAMES: tuple[str, ...] = ()
+LIFT_ACTUATOR_NAME: str | None = None
 
 
 def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]: ...
@@ -96,9 +102,25 @@ def make_task_plan(
 Alternatively, export `step_free_play(t, model, data)` instead of
 `make_task_plan` for a non-scripted scene.
 
+`ARM_PREFIXES` plus scene-global `ROBOT_KIND` is still accepted for bundled
+legacy scenes. New scenes should prefer `MANIPULATORS`, which is parsed into
+per-arm robot adapters at the runtime boundary. The supported topology remains
+deliberately narrow: one or two manipulators, with optional mobile-base
+actuators declared via `BASE_ACTUATOR_NAMES` and an optional vertical lift or
+torso actuator declared via `LIFT_ACTUATOR_NAME`.
+
 `Step` is the timeline boundary. It carries target arm joints, gripper state,
-auxiliary actuator targets, visual state changes, grasp weld transitions,
-attachment weld transitions, and optional `TaskPhase` labels.
+planar base targets, lift targets, remaining auxiliary actuator targets, visual
+state changes, grasp weld transitions, attachment weld transitions, and optional
+`TaskPhase` labels.
+`Step.arm_q` must be a 1-D joint vector; runtime validates its length against
+the parsed robot adapter for that manipulator.
+
+Scene-owned motion is split into three component slots. `Step.base_target`
+drives the `(x, y, yaw)` actuator tuple declared by `BASE_ACTUATOR_NAMES`;
+`Step.lift_target` drives the actuator declared by `LIFT_ACTUATOR_NAME`; and
+`Step.aux_ctrl` is reserved for remaining scene-specific actuators that are not
+part of the arm, planar base, or lift.
 
 ## Architectural Invariants
 

@@ -13,11 +13,11 @@ import inspect
 import math
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, NewType
+from typing import Any, Literal, NewType, cast
 
 # Pick a safe MuJoCo GL backend before importing mujoco. Linux EC2 needs
 # EGL for headless rendering; macOS rejects `egl`, so use GLFW there.
@@ -35,11 +35,19 @@ import numpy as np  # noqa: E402
 from mujoco_workbench.arm_handles import (  # noqa: E402
     ArmHandles,
     ArmSide,
+    ManipulatorSpec,
     RobotKind,
     get_arm_handles,
+    manipulator_specs_from_legacy_arm_sides,
+    parse_robot_kind,
 )
 from mujoco_workbench.cameras import CameraRole  # noqa: E402
-from mujoco_workbench.scene_base import PhaseContract, Step, TaskPhase  # noqa: E402
+from mujoco_workbench.scene_base import (  # noqa: E402
+    MobileBaseTarget,
+    PhaseContract,
+    Step,
+    TaskPhase,
+)
 from mujoco_workbench.scene_check import AttachmentConstraint, CameraInvariant  # noqa: E402
 from mujoco_workbench.welds import (  # noqa: E402
     activate_attachment_weld,
@@ -63,6 +71,33 @@ StepFreePlay = Callable[[float, mujoco.MjModel, mujoco.MjData], None]
 
 
 @dataclass(frozen=True)
+class MobileBaseSpec:
+    """Scene-owned mobile-base actuator names parsed at the module boundary."""
+
+    actuator_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LiftSpec:
+    """Scene-owned vertical lift actuator parsed at the module boundary."""
+
+    actuator_name: str
+
+
+@dataclass(frozen=True)
+class TimelineActuatorMaps:
+    """Resolved actuator ids and qpos/dof addresses for timeline components."""
+
+    base_name_to_id: dict[str, int]
+    base_qposadr: dict[str, int]
+    base_dofadr: dict[str, int]
+    lift_name_to_id: dict[str, int]
+    lift_qposadr: dict[str, int]
+    lift_dofadr: dict[str, int]
+    aux_name_to_id: dict[str, int]
+
+
+@dataclass(frozen=True)
 class LoadedScene:
     """Parsed scene module boundary.
 
@@ -80,9 +115,12 @@ class LoadedScene:
     supports_start_phase: bool
     make_task_plan: MakeTaskPlan | None
     step_free_play: StepFreePlay | None
+    manipulators: tuple[ManipulatorSpec, ...]
     arm_sides: tuple[ArmSide, ...]
     n_cubes: int
     robot_kind: RobotKind
+    mobile_base: MobileBaseSpec | None
+    lift: LiftSpec | None
     grippable_names: tuple[str, ...]
     aux_actuator_names: tuple[str, ...]
     attachment_constraints: tuple[AttachmentConstraint, ...]
@@ -142,15 +180,13 @@ def _tuple_attr(module: ModuleType, attr_name: str) -> tuple[Any, ...]:
     return tuple(value)
 
 
-def _parse_robot_kind(raw_robot_kind: object, scene_name: SceneName) -> RobotKind:
-    if raw_robot_kind == "piper":
-        return "piper"
-    if raw_robot_kind == "ur10e":
-        return "ur10e"
-    raise ValueError(
-        f"scene {scene_name!r} has unsupported ROBOT_KIND={raw_robot_kind!r}; "
-        "expected 'piper' or 'ur10e'"
-    )
+def _parse_scene_robot_kind(raw_robot_kind: object, scene_name: SceneName) -> RobotKind:
+    try:
+        return parse_robot_kind(raw_robot_kind)
+    except ValueError as err:
+        raise ValueError(
+            f"scene {scene_name!r} has unsupported ROBOT_KIND={raw_robot_kind!r}"
+        ) from err
 
 
 def _parse_arm_sides(raw_arm_sides: tuple[Any, ...], scene_name: SceneName) -> tuple[ArmSide, ...]:
@@ -163,6 +199,192 @@ def _parse_arm_sides(raw_arm_sides: tuple[Any, ...], scene_name: SceneName) -> t
         ) from err
 
 
+def _parse_manipulator_side(raw_side: object, scene_name: SceneName) -> ArmSide:
+    try:
+        return ArmSide(str(raw_side))
+    except ValueError as err:
+        valid = ", ".join(side.value for side in ArmSide)
+        raise ValueError(
+            f"scene {scene_name!r} has unsupported manipulator side {raw_side!r}; "
+            f"expected one of: {valid}"
+        ) from err
+
+
+def _parse_manipulator_spec(
+    raw_manipulator: object,
+    scene_name: SceneName,
+    default_robot_kind: RobotKind,
+) -> ManipulatorSpec:
+    if isinstance(raw_manipulator, ManipulatorSpec):
+        return raw_manipulator
+    if isinstance(raw_manipulator, ArmSide):
+        return ManipulatorSpec(side=raw_manipulator, robot_kind=default_robot_kind)
+    if isinstance(raw_manipulator, Mapping):
+        raw_manipulator_mapping = cast(Mapping[str, object], raw_manipulator)
+        raw_side = raw_manipulator_mapping.get("side")
+        raw_robot_kind = raw_manipulator_mapping.get("robot_kind", default_robot_kind)
+        return ManipulatorSpec(
+            side=_parse_manipulator_side(raw_side, scene_name),
+            robot_kind=_parse_scene_robot_kind(raw_robot_kind, scene_name),
+        )
+    raise ValueError(
+        f"scene {scene_name!r} has unsupported MANIPULATORS entry {raw_manipulator!r}; "
+        "expected ManipulatorSpec or {'side': ..., 'robot_kind': ...}"
+    )
+
+
+def _parse_manipulators(
+    module: ModuleType,
+    scene_name: SceneName,
+    default_robot_kind: RobotKind,
+) -> tuple[ManipulatorSpec, ...]:
+    raw_manipulators = _tuple_attr(module, "MANIPULATORS")
+    if raw_manipulators:
+        manipulators = tuple(
+            _parse_manipulator_spec(raw_manipulator, scene_name, default_robot_kind)
+            for raw_manipulator in raw_manipulators
+        )
+    else:
+        arm_sides = _parse_arm_sides(_tuple_attr(module, "ARM_PREFIXES"), scene_name)
+        manipulators = manipulator_specs_from_legacy_arm_sides(arm_sides, default_robot_kind)
+
+    if len(manipulators) > 2:
+        raise ValueError(
+            f"scene {scene_name!r} declares {len(manipulators)} manipulators; "
+            "only unimanual and bimanual scenes are supported"
+        )
+    sides = [manipulator.side for manipulator in manipulators]
+    if len(set(sides)) != len(sides):
+        raise ValueError(f"scene {scene_name!r} declares duplicate manipulator sides")
+    return manipulators
+
+
+def _parse_mobile_base(
+    module: ModuleType,
+    *,
+    scene_name: SceneName,
+) -> MobileBaseSpec | None:
+    raw_base_actuator_names = _tuple_attr(module, "BASE_ACTUATOR_NAMES")
+    if not raw_base_actuator_names:
+        return None
+
+    actuator_names = tuple(str(name) for name in raw_base_actuator_names)
+    if len(actuator_names) != 3:
+        raise ValueError(
+            f"scene {scene_name!r} BASE_ACTUATOR_NAMES must be exactly "
+            "(x, y, yaw); got {actuator_names!r}"
+        )
+    if len(set(actuator_names)) != len(actuator_names):
+        raise ValueError(
+            f"scene {scene_name!r} BASE_ACTUATOR_NAMES contains duplicate names: {actuator_names!r}"
+        )
+    return MobileBaseSpec(actuator_names=actuator_names)
+
+
+def _parse_lift(module: ModuleType, *, scene_name: SceneName) -> LiftSpec | None:
+    raw_lift_actuator_name = getattr(module, "LIFT_ACTUATOR_NAME", None)
+    if raw_lift_actuator_name is None:
+        return None
+    actuator_name = str(raw_lift_actuator_name)
+    if not actuator_name:
+        raise ValueError(f"scene {scene_name!r} LIFT_ACTUATOR_NAME must not be empty")
+    return LiftSpec(actuator_name=actuator_name)
+
+
+def _validate_scene_owned_actuator_names(
+    *,
+    scene_name: SceneName,
+    mobile_base: MobileBaseSpec | None,
+    lift: LiftSpec | None,
+    aux_actuator_names: tuple[str, ...],
+) -> None:
+    component_names: dict[str, str] = {}
+    if mobile_base is not None:
+        for actuator_name in mobile_base.actuator_names:
+            component_names[actuator_name] = "BASE_ACTUATOR_NAMES"
+    if lift is not None:
+        if lift.actuator_name in component_names:
+            raise ValueError(
+                f"scene {scene_name!r} declares lift actuator {lift.actuator_name!r} "
+                "inside BASE_ACTUATOR_NAMES"
+            )
+        component_names[lift.actuator_name] = "LIFT_ACTUATOR_NAME"
+
+    duplicated_names = sorted(name for name in aux_actuator_names if name in component_names)
+    if duplicated_names:
+        owner_list = ", ".join(f"{name} ({component_names[name]})" for name in duplicated_names)
+        raise ValueError(
+            f"scene {scene_name!r} declares {owner_list} again in AUX_ACTUATOR_NAMES; "
+            "aux actuators must exclude arm, base, and lift components"
+        )
+
+
+def _ensure_target_not_in_aux_ctrl(
+    *,
+    scene: LoadedScene,
+    step: Step,
+    forbidden_names: set[str],
+    component_name: str,
+) -> None:
+    if not step.aux_ctrl:
+        return
+    duplicated_names = sorted(str(name) for name in step.aux_ctrl if str(name) in forbidden_names)
+    if duplicated_names:
+        raise ValueError(
+            f"scene {scene.module_name!r} step {step.label!r} puts {component_name} "
+            f"actuator(s) {duplicated_names} in aux_ctrl; use the typed target field instead"
+        )
+
+
+def validate_task_plan_targets(
+    scene: LoadedScene,
+    arms: dict[ArmSide, ArmHandles],
+    task_plan: dict[ArmSide, list[Step]],
+) -> None:
+    """Validate task-plan shape after robot adapters have refined arm metadata."""
+    expected_sides = set(scene.arm_sides)
+    actual_sides = set(task_plan)
+    if actual_sides != expected_sides:
+        raise ValueError(
+            f"scene {scene.module_name!r} task plan sides {sorted(side.value for side in actual_sides)} "
+            f"do not match manipulators {sorted(side.value for side in expected_sides)}"
+        )
+
+    for side, script in task_plan.items():
+        expected_joint_count = len(arms[side].arm_qpos_idx)
+        for step in script:
+            if step.arm_q.shape != (expected_joint_count,):
+                raise ValueError(
+                    f"scene {scene.module_name!r} step {step.label!r} for {side.value} "
+                    f"has arm_q shape {step.arm_q.shape}; expected ({expected_joint_count},) "
+                    f"for {arms[side].robot_kind.value}"
+                )
+            if step.base_target is not None and scene.mobile_base is None:
+                raise ValueError(
+                    f"scene {scene.module_name!r} step {step.label!r} has base_target "
+                    "but the scene declares no BASE_ACTUATOR_NAMES"
+                )
+            if step.lift_target is not None and scene.lift is None:
+                raise ValueError(
+                    f"scene {scene.module_name!r} step {step.label!r} has lift_target "
+                    "but the scene declares no LIFT_ACTUATOR_NAME"
+                )
+            if scene.mobile_base is not None:
+                _ensure_target_not_in_aux_ctrl(
+                    scene=scene,
+                    step=step,
+                    forbidden_names=set(scene.mobile_base.actuator_names),
+                    component_name="mobile base",
+                )
+            if scene.lift is not None:
+                _ensure_target_not_in_aux_ctrl(
+                    scene=scene,
+                    step=step,
+                    forbidden_names={scene.lift.actuator_name},
+                    component_name="lift",
+                )
+
+
 def load_scene(name: SceneName | str) -> LoadedScene:
     """Import and parse a fully qualified scene module."""
     scene_name = SceneName(str(name))
@@ -172,6 +394,17 @@ def load_scene(name: SceneName | str) -> LoadedScene:
     make_task_plan = _optional_callable(module, "make_task_plan")
     step_free_play = _optional_callable(module, "step_free_play")
     supports_start_phase = "start_phase" in inspect.signature(apply_initial_state).parameters
+    robot_kind = _parse_scene_robot_kind(getattr(module, "ROBOT_KIND", RobotKind.PIPER), scene_name)
+    manipulators = _parse_manipulators(module, scene_name, robot_kind)
+    aux_actuator_names = tuple(str(name) for name in _tuple_attr(module, "AUX_ACTUATOR_NAMES"))
+    mobile_base = _parse_mobile_base(module, scene_name=scene_name)
+    lift = _parse_lift(module, scene_name=scene_name)
+    _validate_scene_owned_actuator_names(
+        scene_name=scene_name,
+        mobile_base=mobile_base,
+        lift=lift,
+        aux_actuator_names=aux_actuator_names,
+    )
     return LoadedScene(
         module_name=scene_name,
         display_name=str(getattr(module, "NAME", scene_name)),
@@ -181,11 +414,14 @@ def load_scene(name: SceneName | str) -> LoadedScene:
         supports_start_phase=supports_start_phase,
         make_task_plan=make_task_plan,
         step_free_play=step_free_play,
-        arm_sides=_parse_arm_sides(_tuple_attr(module, "ARM_PREFIXES"), scene_name),
+        manipulators=manipulators,
+        arm_sides=tuple(manipulator.side for manipulator in manipulators),
         n_cubes=int(getattr(module, "N_CUBES", 0)),
-        robot_kind=_parse_robot_kind(getattr(module, "ROBOT_KIND", "piper"), scene_name),
+        robot_kind=robot_kind,
+        mobile_base=mobile_base,
+        lift=lift,
         grippable_names=tuple(str(name) for name in _tuple_attr(module, "GRIPPABLES")),
-        aux_actuator_names=tuple(str(name) for name in _tuple_attr(module, "AUX_ACTUATOR_NAMES")),
+        aux_actuator_names=aux_actuator_names,
         attachment_constraints=tuple(_tuple_attr(module, "ATTACHMENTS")),
         allowed_static_overlaps=tuple(_tuple_attr(module, "ALLOWED_STATIC_OVERLAPS")),
         camera_invariants=tuple(_tuple_attr(module, "CAMERA_INVARIANTS")),
@@ -281,6 +517,8 @@ class _ArmTimelineState:
     t: float
     start_q: np.ndarray
     start_g: float
+    start_base: dict[str, float]
+    start_lift: float | None
     start_aux: dict[str, float]
 
 
@@ -296,10 +534,72 @@ def make_timeline_state(data: mujoco.MjData, arms: dict[ArmSide, ArmHandles]) ->
             t=0.0,
             start_q=np.array([data.qpos[i] for i in arms[side].arm_qpos_idx]),
             start_g=float(data.ctrl[arms[side].act_gripper_id]),
+            start_base={},
+            start_lift=None,
             start_aux={},
         )
         for side in arms
     }
+
+
+def _resolve_position_actuator_qpos_dof(
+    model: mujoco.MjModel,
+    actuator_id: int,
+) -> tuple[int, int]:
+    joint_id = int(model.actuator_trnid[actuator_id][0])
+    return int(model.jnt_qposadr[joint_id]), int(model.jnt_dofadr[joint_id])
+
+
+def _mobile_base_target_values(target: MobileBaseTarget) -> tuple[float, float, float]:
+    return target.as_tuple()
+
+
+def resolve_timeline_actuator_maps(
+    model: mujoco.MjModel,
+    scene: LoadedScene,
+) -> TimelineActuatorMaps:
+    aux_name_to_id = {
+        name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        for name in scene.aux_actuator_names
+    }
+    base_name_to_id = {
+        name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        for name in (scene.mobile_base.actuator_names if scene.mobile_base is not None else ())
+    }
+    base_qposadr: dict[str, int] = {}
+    base_dofadr: dict[str, int] = {}
+    for name, actuator_id in base_name_to_id.items():
+        base_qposadr[name], base_dofadr[name] = _resolve_position_actuator_qpos_dof(
+            model, actuator_id
+        )
+
+    lift_name_to_id = (
+        {
+            scene.lift.actuator_name: mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_ACTUATOR,
+                scene.lift.actuator_name,
+            )
+        }
+        if scene.lift is not None
+        else {}
+    )
+    lift_qposadr: dict[str, int] = {}
+    lift_dofadr: dict[str, int] = {}
+    for name, actuator_id in lift_name_to_id.items():
+        lift_qposadr[name], lift_dofadr[name] = _resolve_position_actuator_qpos_dof(
+            model, actuator_id
+        )
+
+    return TimelineActuatorMaps(
+        base_name_to_id=base_name_to_id,
+        base_qposadr=base_qposadr,
+        base_dofadr=base_dofadr,
+        lift_name_to_id=lift_name_to_id,
+        lift_qposadr=lift_qposadr,
+        lift_dofadr=lift_dofadr,
+        aux_name_to_id=aux_name_to_id,
+    )
 
 
 def _advance_one_arm(
@@ -309,6 +609,12 @@ def _advance_one_arm(
     script: list[Step],
     st: _ArmTimelineState,
     sim_dt: float,
+    base_name_to_id: dict[str, int],
+    base_qposadr: dict[str, int],
+    base_dofadr: dict[str, int],
+    lift_name_to_id: dict[str, int],
+    lift_qposadr: dict[str, int],
+    lift_dofadr: dict[str, int],
     aux_name_to_id: dict[str, int],
     cube_body_ids: list[int],
 ) -> None:
@@ -382,13 +688,49 @@ def _advance_one_arm(
 
     target_gripper = arm.gripper_open if step.gripper == "open" else arm.gripper_closed
     curr_g = (1.0 - alpha_s) * st.start_g + alpha_s * target_gripper
-    if arm.robot_kind == "piper":
-        data.qpos[arm.qpos_idx[6]] = curr_g
-        data.qpos[arm.qpos_idx[7]] = -curr_g
-        data.qvel[arm.dof_idx[6]] = 0.0
-        data.qvel[arm.dof_idx[7]] = 0.0
+    if (
+        arm.piper_mirrored_gripper_qpos_idx is not None
+        and arm.piper_mirrored_gripper_dof_idx is not None
+    ):
+        left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
+        left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
+        data.qpos[left_gripper_qpos_idx] = curr_g
+        data.qpos[right_gripper_qpos_idx] = -curr_g
+        data.qvel[left_gripper_dof_idx] = 0.0
+        data.qvel[right_gripper_dof_idx] = 0.0
     # UR10e + 2F-85: actuator drives the tendon equality; finger joints settle.
     data.ctrl[arm.act_gripper_id] = curr_g
+
+    if step.base_target is not None:
+        if not base_name_to_id:
+            raise ValueError(
+                f"step {step.label!r} has base_target but no base actuators are resolved"
+            )
+        for base_name, base_target in zip(
+            base_name_to_id,
+            _mobile_base_target_values(step.base_target),
+            strict=True,
+        ):
+            actuator_id = base_name_to_id[base_name]
+            start = st.start_base.get(base_name, float(data.qpos[base_qposadr[base_name]]))
+            current_base_value = (1.0 - alpha_s) * start + alpha_s * base_target
+            data.qpos[base_qposadr[base_name]] = current_base_value
+            data.qvel[base_dofadr[base_name]] = 0.0
+            data.ctrl[actuator_id] = current_base_value
+
+    if step.lift_target is not None:
+        if not lift_name_to_id:
+            raise ValueError(
+                f"step {step.label!r} has lift_target but no lift actuator is resolved"
+            )
+        for lift_name, actuator_id in lift_name_to_id.items():
+            start = st.start_lift
+            if start is None:
+                start = float(data.qpos[lift_qposadr[lift_name]])
+            current_lift_value = (1.0 - alpha_s) * start + alpha_s * step.lift_target.position
+            data.qpos[lift_qposadr[lift_name]] = current_lift_value
+            data.qvel[lift_dofadr[lift_name]] = 0.0
+            data.ctrl[actuator_id] = current_lift_value
 
     if step.aux_ctrl:
         for aux_name, aux_target in step.aux_ctrl.items():
@@ -406,6 +748,15 @@ def _advance_one_arm(
     if alpha >= 1.0:
         st.start_q = step.arm_q.copy()
         st.start_g = target_gripper
+        if step.base_target is not None:
+            for base_name, base_target in zip(
+                base_name_to_id,
+                _mobile_base_target_values(step.base_target),
+                strict=True,
+            ):
+                st.start_base[base_name] = base_target
+        if step.lift_target is not None:
+            st.start_lift = step.lift_target.position
         if step.aux_ctrl:
             for aux_name, aux_target in step.aux_ctrl.items():
                 st.start_aux[str(aux_name)] = aux_target
@@ -418,6 +769,12 @@ def advance_timeline(
     data: mujoco.MjData,
     arms: dict[ArmSide, ArmHandles],
     task_plan: dict[ArmSide, list[Step]],
+    base_name_to_id: dict[str, int],
+    base_qposadr: dict[str, int],
+    base_dofadr: dict[str, int],
+    lift_name_to_id: dict[str, int],
+    lift_qposadr: dict[str, int],
+    lift_dofadr: dict[str, int],
     aux_name_to_id: dict[str, int],
     cube_body_ids: list[int],
     sim_dt: float,
@@ -432,6 +789,12 @@ def advance_timeline(
         arms,
         task_plan,
         state,
+        base_name_to_id,
+        base_qposadr,
+        base_dofadr,
+        lift_name_to_id,
+        lift_qposadr,
+        lift_dofadr,
         aux_name_to_id,
         cube_body_ids,
         sim_dt,
@@ -445,6 +808,12 @@ def advance_timeline_with_state(
     arms: dict[ArmSide, ArmHandles],
     task_plan: dict[ArmSide, list[Step]],
     state: TimelineState,
+    base_name_to_id: dict[str, int],
+    base_qposadr: dict[str, int],
+    base_dofadr: dict[str, int],
+    lift_name_to_id: dict[str, int],
+    lift_qposadr: dict[str, int],
+    lift_dofadr: dict[str, int],
     aux_name_to_id: dict[str, int],
     cube_body_ids: list[int],
     sim_dt: float,
@@ -461,6 +830,12 @@ def advance_timeline_with_state(
                 task_plan[side],
                 state[side],
                 sim_dt,
+                base_name_to_id,
+                base_qposadr,
+                base_dofadr,
+                lift_name_to_id,
+                lift_qposadr,
+                lift_dofadr,
                 aux_name_to_id,
                 cube_body_ids,
             )
@@ -492,13 +867,10 @@ def build_scene_and_advance(scene_name: SceneName | str, t: Seconds | float = 0.
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name) for name in scene.grippable_names
     ]
     arms: dict[ArmSide, ArmHandles] = {
-        side: get_arm_handles(model, side, scene.n_cubes, scene.robot_kind)
-        for side in scene.arm_sides
+        manipulator.side: get_arm_handles(model, manipulator, scene.n_cubes)
+        for manipulator in scene.manipulators
     }
-    aux_name_to_id = {
-        name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        for name in scene.aux_actuator_names
-    }
+    timeline_actuators = resolve_timeline_actuator_maps(model, scene)
     scene.apply_initial_state(model, data, arms, cube_body_ids)
 
     task_plan: dict[ArmSide, list[Step]] | None = None
@@ -506,6 +878,7 @@ def build_scene_and_advance(scene_name: SceneName | str, t: Seconds | float = 0.
         # Re-apply initial state after `snap` so t=0 renders show home pose,
         # not whatever IK seeding state the planner left behind.
         task_plan = scene.make_task_plan(model, data, arms, cube_body_ids)
+        validate_task_plan_targets(scene, arms, task_plan)
         scene.apply_initial_state(model, data, arms, cube_body_ids)
     if task_plan is not None and float(t) > 0:
         sim_dt = float(model.opt.timestep)
@@ -514,7 +887,13 @@ def build_scene_and_advance(scene_name: SceneName | str, t: Seconds | float = 0.
             data,
             arms,
             task_plan,
-            aux_name_to_id,
+            timeline_actuators.base_name_to_id,
+            timeline_actuators.base_qposadr,
+            timeline_actuators.base_dofadr,
+            timeline_actuators.lift_name_to_id,
+            timeline_actuators.lift_qposadr,
+            timeline_actuators.lift_dofadr,
+            timeline_actuators.aux_name_to_id,
             cube_body_ids,
             sim_dt,
             Seconds(float(t)),

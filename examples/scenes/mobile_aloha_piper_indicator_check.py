@@ -46,6 +46,7 @@ from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.scene_base import (
     GripperState,
     JointSetStatic,
+    MobileBaseTarget,
     PhaseContract,
     PhaseState,
     QaccSentinel,
@@ -68,8 +69,8 @@ N_CUBES = 0
 ATTACHMENTS: tuple[AttachmentConstraint, ...] = ()
 
 
-class IndicatorAux(StrEnum):
-    """Scene-owned planar-base actuators addressable via Step.aux_ctrl."""
+class IndicatorBaseActuator(StrEnum):
+    """Planar mobile-base actuators."""
 
     BASE_X = BASE_X_JOINT_NAME
     BASE_Y = BASE_Y_JOINT_NAME
@@ -84,7 +85,12 @@ class RotationAxis(StrEnum):
     Z = "z"
 
 
-AUX_ACTUATOR_NAMES: tuple[str, ...] = tuple(m.value for m in IndicatorAux)
+AUX_ACTUATOR_NAMES: tuple[str, ...] = ()
+BASE_ACTUATOR_NAMES: tuple[str, ...] = (
+    IndicatorBaseActuator.BASE_X.value,
+    IndicatorBaseActuator.BASE_Y.value,
+    IndicatorBaseActuator.BASE_YAW.value,
+)
 
 
 def _axis_angle_quat(axis: RotationAxis, angle_rad: float) -> QuatWxyz:
@@ -122,13 +128,9 @@ def _mjcf_quat(quat: QuatWxyz) -> list[float]:
     return [float(value) for value in quat]
 
 
-def base_aux_targets(*, x: float, y: float, yaw: float) -> tuple[tuple[str, float], ...]:
+def base_target(*, x: float, y: float, yaw: float) -> MobileBaseTarget:
     """Canonical phase-boundary representation for planar base targets."""
-    return (
-        (IndicatorAux.BASE_X, x),
-        (IndicatorAux.BASE_Y, y),
-        (IndicatorAux.BASE_YAW, yaw),
-    )
+    return MobileBaseTarget(x=x, y=y, yaw=yaw)
 
 
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (
@@ -151,11 +153,33 @@ CAMERA_INVARIANTS: tuple[CameraInvariant, ...] = (
     FixedCameraInvariant(name="right/wrist_d405_cam", parent_body="right/link6"),
 )
 
+_ALERT_SERVER_TOUCH_GEOM_NAMES: tuple[str, ...] = (
+    ALERT_LIGHT_GEOM_NAME,
+    *(
+        f"server_{LAYOUT.alert.row}_r{LAYOUT.alert.rack_index}_s{slot_index:02d}"
+        for slot_index in range(
+            max(0, LAYOUT.alert.slot_index - 1),
+            min(LAYOUT.servers.n_per_rack, LAYOUT.alert.slot_index + 3),
+        )
+    ),
+)
+_FINGERTIP_BODY_NAMES: tuple[str, ...] = tuple(
+    f"{side.value}{finger_body_name}"
+    for side in ARM_PREFIXES
+    for finger_body_name in ("link7", "link8")
+)
+
 # All static geometry sits inside one `data_center` body (racks + servers +
 # lights), so scene_check's same-body skip handles within-body overlaps.
-# No cross-body overlaps are expected — the chassis stays clear of rack
-# panels at every phase boundary by construction (see layout invariants).
-ALLOWED_STATIC_OVERLAPS: tuple[tuple[str, str], ...] = ()
+# The indicator-check gesture intentionally brings the Piper fingertips into
+# contact/near-contact with the alert light and the adjacent server face. Keep
+# those contact-like pairs out of clearance diagnostics so the golden scene
+# reports unexpected collisions rather than the task's intended touch target.
+ALLOWED_STATIC_OVERLAPS: tuple[tuple[str, str], ...] = tuple(
+    (finger_body_name, target_geom_name)
+    for finger_body_name in _FINGERTIP_BODY_NAMES
+    for target_geom_name in _ALERT_SERVER_TOUCH_GEOM_NAMES
+)
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +280,9 @@ _BASE_STATIC = JointSetStatic(joint_names=IK_LOCKED_JOINT_NAMES, label="base")
 _CLICK_X, _CLICK_Y = LAYOUT.click_chassis_xy
 _CLICK_YAW = math.pi / 2.0 if LAYOUT.alert.row == "left" else -math.pi / 2.0
 
-_BASE_ORIGIN = base_aux_targets(x=0.0, y=0.0, yaw=0.0)
-_BASE_AT_TRAVERSE_END = base_aux_targets(x=_CLICK_X, y=0.0, yaw=0.0)
-_BASE_AT_CLICK = base_aux_targets(x=_CLICK_X, y=_CLICK_Y, yaw=_CLICK_YAW)
+_BASE_ORIGIN = base_target(x=0.0, y=0.0, yaw=0.0)
+_BASE_AT_TRAVERSE_END = base_target(x=_CLICK_X, y=0.0, yaw=0.0)
+_BASE_AT_CLICK = base_target(x=_CLICK_X, y=_CLICK_Y, yaw=_CLICK_YAW)
 
 
 PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
@@ -266,11 +290,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.SETUP,
         starts=PhaseState(
             description="Robot at world origin, all indicator lights set.",
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
         ),
         ends=PhaseState(
             description="Hold complete; ready to drive into aisle.",
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
         ),
         invariants=(_QACC_SENTINEL, _ARMS_STATIC, _BASE_STATIC),
     ),
@@ -281,11 +305,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.TRAVERSE_INTO_AISLE,
         starts=PhaseState(
             description="Robot at origin facing +X.",
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
         ),
         ends=PhaseState(
             description="Robot in aisle aligned with alert rack column; still facing +X.",
-            base_aux=_BASE_AT_TRAVERSE_END,
+            base_target=_BASE_AT_TRAVERSE_END,
         ),
         invariants=(_QACC_SENTINEL, _ARMS_STATIC),
     ),
@@ -297,11 +321,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.ALIGN_TO_TARGET,
         starts=PhaseState(
             description="Robot in aisle, facing +X.",
-            base_aux=_BASE_AT_TRAVERSE_END,
+            base_target=_BASE_AT_TRAVERSE_END,
         ),
         ends=PhaseState(
             description="Robot facing the alert row, chassis nose at rack front.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         invariants=(_QACC_SENTINEL, _ARMS_STATIC),
     ),
@@ -311,11 +335,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.REACH_TO_SERVER,
         starts=PhaseState(
             description="Arms at home, robot at click pose.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         ends=PhaseState(
             description="Arms extended near the alert server's bezel.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         invariants=(_QACC_SENTINEL, _BASE_STATIC),
     ),
@@ -327,11 +351,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.WAIT_AT_SERVER,
         starts=PhaseState(
             description="Both arms at the alert server; light still red.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         ends=PhaseState(
             description="Light flipped green; demo logically complete.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         invariants=(_QACC_SENTINEL, _ARMS_STATIC, _BASE_STATIC),
     ),
@@ -341,11 +365,11 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
         phase=TaskPhase.RETRACT,
         starts=PhaseState(
             description="Arms extended at the alert server.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         ends=PhaseState(
             description="Arms at home; demo complete.",
-            base_aux=_BASE_AT_CLICK,
+            base_target=_BASE_AT_CLICK,
         ),
         invariants=(_QACC_SENTINEL, _BASE_STATIC),
     ),
@@ -737,8 +761,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # Planar-base actuators — same pattern as the live scene.
     root.actuator.add(
         "position",
-        name=IndicatorAux.BASE_X,
-        joint=IndicatorAux.BASE_X,
+        name=IndicatorBaseActuator.BASE_X,
+        joint=IndicatorBaseActuator.BASE_X,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -746,8 +770,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=IndicatorAux.BASE_Y,
-        joint=IndicatorAux.BASE_Y,
+        name=IndicatorBaseActuator.BASE_Y,
+        joint=IndicatorBaseActuator.BASE_Y,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -755,8 +779,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=IndicatorAux.BASE_YAW,
-        joint=IndicatorAux.BASE_YAW,
+        name=IndicatorBaseActuator.BASE_YAW,
+        joint=IndicatorBaseActuator.BASE_YAW,
         kp=8000.0,
         kv=200.0,
         ctrllimited="true",
@@ -786,7 +810,7 @@ def apply_initial_state(
     start_phase: TaskPhase | None = None,
 ) -> None:
     """Reset to scene home (arms at `HOME_ARM_Q_BY_SIDE`, base at origin),
-    or seed the chassis pose from a specific phase's contract `starts.base_aux`
+    or seed the chassis pose from a specific phase's contract `starts.base_target`
     when `start_phase` is set. Arms always reset to home — the user is
     expected to teleop them into the desired pose for whatever phase
     they're authoring.
@@ -801,12 +825,8 @@ def apply_initial_state(
                 "booting at scene home."
             )
         else:
-            base_aux_dict = {str(name): float(value) for name, value in contract.starts.base_aux}
-            base_pose = (
-                base_aux_dict.get(BASE_X_JOINT_NAME, 0.0),
-                base_aux_dict.get(BASE_Y_JOINT_NAME, 0.0),
-                base_aux_dict.get(BASE_YAW_JOINT_NAME, 0.0),
-            )
+            if contract.starts.base_target is not None:
+                base_pose = contract.starts.base_target.as_tuple()
 
     mujoco.mj_resetData(model, data)
     for arm in arms.values():
@@ -819,13 +839,22 @@ def apply_initial_state(
         data.ctrl[arm.act_gripper_id] = arm.gripper_open
         # Mirror the gripper open value into the tendon-coupled finger
         # slides (Piper has two finger qpos that mirror each other).
-        if arm.robot_kind == "piper":
-            data.qpos[arm.qpos_idx[6]] = arm.gripper_open
-            data.qpos[arm.qpos_idx[7]] = -arm.gripper_open
-            data.qvel[arm.dof_idx[6]] = 0.0
-            data.qvel[arm.dof_idx[7]] = 0.0
+        if (
+            arm.piper_mirrored_gripper_qpos_idx is not None
+            and arm.piper_mirrored_gripper_dof_idx is not None
+        ):
+            left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
+            left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
+            data.qpos[left_gripper_qpos_idx] = arm.gripper_open
+            data.qpos[right_gripper_qpos_idx] = -arm.gripper_open
+            data.qvel[left_gripper_dof_idx] = 0.0
+            data.qvel[right_gripper_dof_idx] = 0.0
     for jname, value in zip(
-        (IndicatorAux.BASE_X, IndicatorAux.BASE_Y, IndicatorAux.BASE_YAW),
+        (
+            IndicatorBaseActuator.BASE_X,
+            IndicatorBaseActuator.BASE_Y,
+            IndicatorBaseActuator.BASE_YAW,
+        ),
         base_pose,
         strict=True,
     ):
@@ -858,12 +887,11 @@ def make_task_plan(
         label: str,
         duration: float,
         phase: TaskPhase,
-        aux: tuple[tuple[str, float], ...] | dict[str, float] | None = None,
+        base: MobileBaseTarget | None = None,
         *,
         gripper: GripperState = "open",
         set_geom_rgba: tuple[tuple[str, tuple[float, float, float, float]], ...] = (),
     ) -> None:
-        aux_dict = dict(aux) if aux is not None else None
         for side in ARM_PREFIXES:
             scripts[side].append(
                 Step(
@@ -872,7 +900,7 @@ def make_task_plan(
                     gripper=gripper,
                     duration=duration,
                     phase=phase,
-                    aux_ctrl=aux_dict,
+                    base_target=base,
                     set_geom_rgba=set_geom_rgba,
                 )
             )
@@ -882,11 +910,10 @@ def make_task_plan(
         duration: float,
         phase: TaskPhase,
         arm_q_by_side: dict[ArmSide, np.ndarray],
-        aux: tuple[tuple[str, float], ...] | dict[str, float],
+        base: MobileBaseTarget,
         *,
         gripper: GripperState = "open",
     ) -> None:
-        aux_dict = dict(aux)
         for side in ARM_PREFIXES:
             scripts[side].append(
                 Step(
@@ -895,18 +922,18 @@ def make_task_plan(
                     gripper=gripper,
                     duration=duration,
                     phase=phase,
-                    aux_ctrl=aux_dict,
+                    base_target=base,
                 )
             )
 
-    aux_origin = dict(_BASE_ORIGIN)
-    aux_traverse_end = dict(_BASE_AT_TRAVERSE_END)
-    aux_yaw_only = dict(base_aux_targets(x=_CLICK_X, y=0.0, yaw=_CLICK_YAW))
-    aux_click = dict(_BASE_AT_CLICK)
+    base_origin = _BASE_ORIGIN
+    base_traverse_end = _BASE_AT_TRAVERSE_END
+    base_yaw_only = base_target(x=_CLICK_X, y=0.0, yaw=_CLICK_YAW)
+    base_click = _BASE_AT_CLICK
 
     # === SETUP ============================================================
-    push_both("home", 1.0, TaskPhase.SETUP, aux=aux_origin)
-    push_both("settle", 0.5, TaskPhase.SETUP, aux=aux_origin)
+    push_both("home", 1.0, TaskPhase.SETUP, base=base_origin)
+    push_both("settle", 0.5, TaskPhase.SETUP, base=base_origin)
 
     # === TRAVERSE_INTO_AISLE =============================================
     # ~5 m drive at ~0.5 m/s — realistic indoor mobile-robot cruise.
@@ -914,7 +941,7 @@ def make_task_plan(
         "drive into aisle",
         10.0,
         TaskPhase.TRAVERSE_INTO_AISLE,
-        aux=aux_traverse_end,
+        base=base_traverse_end,
     )
 
     # === ALIGN_TO_TARGET =================================================
@@ -927,13 +954,13 @@ def make_task_plan(
         "yaw to face alert row",
         4.0,
         TaskPhase.ALIGN_TO_TARGET,
-        aux=aux_yaw_only,
+        base=base_yaw_only,
     )
     push_both(
         "step toward rack front",
         2.0,
         TaskPhase.ALIGN_TO_TARGET,
-        aux=aux_click,
+        base=base_click,
     )
 
     # === REACH_TO_SERVER =================================================
@@ -956,7 +983,7 @@ def make_task_plan(
         3.0,
         TaskPhase.REACH_TO_SERVER,
         q_reach,
-        aux_click,
+        base_click,
     )
 
     # === WAIT_AT_SERVER ==================================================
@@ -976,7 +1003,7 @@ def make_task_plan(
                 gripper="closed",
                 duration=0.5,
                 phase=TaskPhase.WAIT_AT_SERVER,
-                aux_ctrl=aux_click,
+                base_target=base_click,
             )
         )
         scripts[ArmSide.RIGHT].append(
@@ -986,7 +1013,7 @@ def make_task_plan(
                 gripper="open",
                 duration=0.5,
                 phase=TaskPhase.WAIT_AT_SERVER,
-                aux_ctrl=aux_click,
+                base_target=base_click,
             )
         )
         # L opens while R closes
@@ -997,7 +1024,7 @@ def make_task_plan(
                 gripper="open",
                 duration=0.5,
                 phase=TaskPhase.WAIT_AT_SERVER,
-                aux_ctrl=aux_click,
+                base_target=base_click,
             )
         )
         scripts[ArmSide.RIGHT].append(
@@ -1007,7 +1034,7 @@ def make_task_plan(
                 gripper="closed",
                 duration=0.5,
                 phase=TaskPhase.WAIT_AT_SERVER,
-                aux_ctrl=aux_click,
+                base_target=base_click,
             )
         )
     for side in ARM_PREFIXES:
@@ -1018,7 +1045,7 @@ def make_task_plan(
                 gripper="open",
                 duration=1.5,
                 phase=TaskPhase.WAIT_AT_SERVER,
-                aux_ctrl=aux_click,
+                base_target=base_click,
                 # Only the LEFT arm's step carries the rgba flip — the
                 # mechanism is global, doesn't matter which arm's step
                 # triggers it. Putting it on one side avoids a redundant
@@ -1039,7 +1066,7 @@ def make_task_plan(
         "arms back to home",
         2.0,
         TaskPhase.RETRACT,
-        aux=aux_click,
+        base=base_click,
     )
 
     for side in ARM_PREFIXES:

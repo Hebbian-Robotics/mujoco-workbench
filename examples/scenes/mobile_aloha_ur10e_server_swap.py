@@ -25,7 +25,7 @@ both arms reach matched handle world coords each step.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -64,6 +64,7 @@ from mujoco_workbench.scene_base import (
     GripperStateHold,
     HeldObjectLevelness,
     JointSetStatic,
+    MobileBaseTarget,
     PhaseContract,
     PhaseState,
     Position3,
@@ -94,20 +95,20 @@ GRIPPABLES: tuple[str, ...] = ("server", "new_server")
 N_CUBES = len(GRIPPABLES)
 
 
-class DataCenterAux(StrEnum):
-    """Scene-owned (non-arm) actuators addressable via Step.aux_ctrl.
-
-    Drive the 3-DOF planar base joint added by `load_mobile_aloha`. mink IK
-    locks these so the planner uses only the arm chain. No lift entry —
-    Mobile ALOHA is lift-less, so z-motion is via the arms.
-    """
+class DataCenterBaseActuator(StrEnum):
+    """Planar mobile-base actuators added by `load_mobile_aloha`."""
 
     BASE_X = BASE_X_JOINT_NAME
     BASE_Y = BASE_Y_JOINT_NAME
     BASE_YAW = BASE_YAW_JOINT_NAME
 
 
-AUX_ACTUATOR_NAMES: tuple[str, ...] = tuple(m.value for m in DataCenterAux)
+AUX_ACTUATOR_NAMES: tuple[str, ...] = ()
+BASE_ACTUATOR_NAMES: tuple[str, ...] = (
+    DataCenterBaseActuator.BASE_X.value,
+    DataCenterBaseActuator.BASE_Y.value,
+    DataCenterBaseActuator.BASE_YAW.value,
+)
 
 # Base waypoints (per NEW_LAYOUT.md). `base_link` starts at world origin so
 # qpos values equal world coords.
@@ -128,13 +129,9 @@ CART_HANDLE_APPROACH_M = 0.05
 CART_HANDLE_LIFT_CLEARANCE_M = 0.05
 
 
-def base_aux_targets(*, x: float, y: float, yaw: float) -> tuple[tuple[str, float], ...]:
+def base_target(*, x: float, y: float, yaw: float) -> MobileBaseTarget:
     """Canonical phase-boundary representation for planar base targets."""
-    return (
-        (DataCenterAux.BASE_X, x),
-        (DataCenterAux.BASE_Y, y),
-        (DataCenterAux.BASE_YAW, yaw),
-    )
+    return MobileBaseTarget(x=x, y=y, yaw=yaw)
 
 
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (
@@ -338,10 +335,10 @@ _NEW_SERVER_LEVEL = HeldObjectLevelness(
 )
 
 
-_BASE_ORIGIN = base_aux_targets(x=0.0, y=0.0, yaw=0.0)
-_BASE_PRE_EXTRACT = base_aux_targets(x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
-_BASE_AT_CART = base_aux_targets(x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART)
-_BASE_AT_INSERT = base_aux_targets(x=BASE_AT_INSERT, y=0.0, yaw=0.0)
+_BASE_ORIGIN = base_target(x=0.0, y=0.0, yaw=0.0)
+_BASE_PRE_EXTRACT = base_target(x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
+_BASE_AT_CART = base_target(x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART)
+_BASE_AT_INSERT = base_target(x=BASE_AT_INSERT, y=0.0, yaw=0.0)
 
 
 PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
@@ -357,7 +354,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_ON_CART_BOTTOM,
                 AttachmentWeldName.NEW_IN_RACK,
             ),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_SERVER_IN_RACK_POSE, _NEW_SERVER_ON_CART_TOP_POSE),
         ),
         ends=PhaseState(
@@ -366,7 +363,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_IN_RACK,
                 AttachmentWeldName.NEW_ON_CART_TOP,
             ),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_SERVER_IN_RACK_POSE, _NEW_SERVER_ON_CART_TOP_POSE),
         ),
         invariants=(
@@ -388,14 +385,14 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_IN_RACK,
                 AttachmentWeldName.NEW_ON_CART_TOP,
             ),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_SERVER_IN_RACK_POSE, _NEW_SERVER_ON_CART_TOP_POSE),
         ),
         ends=PhaseState(
             description="Server gripped bimanually, pulled 10 cm clear of detents; base unchanged.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         invariants=(
@@ -415,14 +412,14 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Server gripped bimanually; base at origin.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         ends=PhaseState(
             description="Base reversed to pre-extract pose; arms unchanged.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_PRE_EXTRACT,
+            base_target=_BASE_PRE_EXTRACT,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         invariants=(
@@ -442,14 +439,14 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Base at pre-extract; server held bimanually.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_PRE_EXTRACT,
+            base_target=_BASE_PRE_EXTRACT,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         ends=PhaseState(
             description="Base parked at cart facing +Y; arms unchanged.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         invariants=(
@@ -469,7 +466,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Base at cart; old server held bimanually.",
             active_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(_NEW_SERVER_ON_CART_TOP_POSE,),
         ),
         ends=PhaseState(
@@ -479,7 +476,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.NEW_ON_CART_TOP,
             ),
             inactive_attachments=(AttachmentWeldName.SERVER_IN_RACK,),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(
                 _OLD_SERVER_ON_CART_BOTTOM_POSE,
                 _NEW_SERVER_ON_CART_TOP_POSE,
@@ -503,7 +500,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_ON_CART_BOTTOM,
                 AttachmentWeldName.NEW_ON_CART_TOP,
             ),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(
                 _OLD_SERVER_ON_CART_BOTTOM_POSE,
                 _NEW_SERVER_ON_CART_TOP_POSE,
@@ -513,7 +510,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="New server gripped bimanually and lifted clear of the cart.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         invariants=(
@@ -532,14 +529,14 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Base at cart with new server held bimanually.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_AT_CART,
+            base_target=_BASE_AT_CART,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         ends=PhaseState(
             description="Base back at origin facing +X; arms unchanged.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         invariants=(
@@ -560,14 +557,14 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Base at origin facing +X with new server held.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         ends=PhaseState(
             description="Base advanced to insert offset; arms unchanged.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_AT_INSERT,
+            base_target=_BASE_AT_INSERT,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         invariants=(
@@ -588,7 +585,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
             description="Base at insert; new server held bimanually.",
             active_attachments=(AttachmentWeldName.SERVER_ON_CART_BOTTOM,),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_AT_INSERT,
+            base_target=_BASE_AT_INSERT,
             expected_grippable_poses=(_OLD_SERVER_ON_CART_BOTTOM_POSE,),
         ),
         ends=PhaseState(
@@ -598,7 +595,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.NEW_IN_RACK,
             ),
             inactive_attachments=(AttachmentWeldName.NEW_ON_CART_TOP,),
-            base_aux=_BASE_AT_INSERT,
+            base_target=_BASE_AT_INSERT,
             expected_grippable_poses=(
                 _OLD_SERVER_ON_CART_BOTTOM_POSE,
                 _NEW_SERVER_IN_RACK_POSE,
@@ -624,7 +621,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_ON_CART_BOTTOM,
                 AttachmentWeldName.NEW_IN_RACK,
             ),
-            base_aux=_BASE_AT_INSERT,
+            base_target=_BASE_AT_INSERT,
             expected_grippable_poses=(
                 _OLD_SERVER_ON_CART_BOTTOM_POSE,
                 _NEW_SERVER_IN_RACK_POSE,
@@ -636,7 +633,7 @@ PHASE_CONTRACTS: tuple[PhaseContract, ...] = (
                 AttachmentWeldName.SERVER_ON_CART_BOTTOM,
                 AttachmentWeldName.NEW_IN_RACK,
             ),
-            base_aux=_BASE_ORIGIN,
+            base_target=_BASE_ORIGIN,
             expected_grippable_poses=(
                 _OLD_SERVER_ON_CART_BOTTOM_POSE,
                 _NEW_SERVER_IN_RACK_POSE,
@@ -894,7 +891,7 @@ def _add_server_body(
     )
     # Cylinder `fromto` puts the outer tip on the bezel plane (x = -half[0]
     # in server-local frame) and the inner end recessed by `handle_length`.
-    for side_label, y_sign in (("L", -1.0), ("R", +1.0)):
+    for side_label, y_sign in (("L", +1.0), ("R", -1.0)):
         server.add(
             "geom",
             name=f"{name}_handle_{side_label}",
@@ -1130,8 +1127,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # ---------------------- Actuators: planar base only -------------------
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_X,
-        joint=DataCenterAux.BASE_X,
+        name=DataCenterBaseActuator.BASE_X,
+        joint=DataCenterBaseActuator.BASE_X,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -1139,8 +1136,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_Y,
-        joint=DataCenterAux.BASE_Y,
+        name=DataCenterBaseActuator.BASE_Y,
+        joint=DataCenterBaseActuator.BASE_Y,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -1148,8 +1145,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_YAW,
-        joint=DataCenterAux.BASE_YAW,
+        name=DataCenterBaseActuator.BASE_YAW,
+        joint=DataCenterBaseActuator.BASE_YAW,
         kp=8000.0,
         kv=200.0,
         ctrllimited="true",
@@ -1277,7 +1274,11 @@ def apply_initial_state(
         for eq_id in arm.weld_ids:
             data.eq_active[eq_id] = 0
     for jname, value in zip(
-        (DataCenterAux.BASE_X, DataCenterAux.BASE_Y, DataCenterAux.BASE_YAW),
+        (
+            DataCenterBaseActuator.BASE_X,
+            DataCenterBaseActuator.BASE_Y,
+            DataCenterBaseActuator.BASE_YAW,
+        ),
         base_pose,
         strict=True,
     ):
@@ -1400,9 +1401,9 @@ def _snap_factory(
             orientation=PositionOnly(),
             seed_q=q_seed["current"],
             locked_joint_names=(
-                DataCenterAux.BASE_X,
-                DataCenterAux.BASE_Y,
-                DataCenterAux.BASE_YAW,
+                DataCenterBaseActuator.BASE_X,
+                DataCenterBaseActuator.BASE_Y,
+                DataCenterBaseActuator.BASE_YAW,
             ),
             solver="daqp",
         )
@@ -1445,7 +1446,7 @@ def make_task_plan(
         label: str,
         duration: float,
         phase: TaskPhase,
-        aux: Mapping[Any, float] | None = None,
+        base: MobileBaseTarget | None = None,
         gripper: GripperState = "closed",
     ) -> None:
         """Append a "both arms hold home" step to both timelines.
@@ -1460,13 +1461,15 @@ def make_task_plan(
                     gripper=gripper,
                     duration=duration,
                     phase=phase,
-                    aux_ctrl=aux,
+                    base_target=base,
                 )
             )
 
-    base_x_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_X)
-    base_y_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_Y)
-    base_yaw_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_YAW)
+    base_x_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_X)
+    base_y_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_Y)
+    base_yaw_jnt = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_YAW
+    )
 
     def seed_at_base(
         base_x: float = 0.0,
@@ -1493,13 +1496,10 @@ def make_task_plan(
             _snap_factory(model, data, arms[ArmSide.RIGHT]),
         )
 
-    def base_aux(*, x: float, y: float, yaw: float) -> dict[str, float]:
-        return dict(base_aux_targets(x=x, y=y, yaw=yaw))
-
-    aux_at_rack = base_aux(x=0.0, y=0.0, yaw=0.0)
-    aux_pre_extract = base_aux(x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
-    aux_at_cart = base_aux(x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART)
-    aux_at_insert = base_aux(x=BASE_AT_INSERT, y=0.0, yaw=0.0)
+    base_at_rack = base_target(x=0.0, y=0.0, yaw=0.0)
+    base_pre_extract = base_target(x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
+    base_at_cart = base_target(x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART)
+    base_at_insert = base_target(x=BASE_AT_INSERT, y=0.0, yaw=0.0)
 
     # The left arm owns the load-bearing weld. The right arm still visits the
     # opposite handle for visual support, but it does not constrain the same
@@ -1511,8 +1511,8 @@ def make_task_plan(
     new_grasp = {side: grasp_weld(side, new_server_id) for side in ARM_PREFIXES}
 
     # === SETUP ============================================================
-    push_both("home", 1.0, TaskPhase.SETUP, aux=aux_at_rack)
-    push_both("settle at home", 1.0, TaskPhase.SETUP, aux=aux_at_rack)
+    push_both("home", 1.0, TaskPhase.SETUP, base=base_at_rack)
+    push_both("settle at home", 1.0, TaskPhase.SETUP, base=base_at_rack)
 
     # === REMOVE_OLD_SERVER (arm-only at base = origin) ====================
     # Approach + grip + 10 cm pull-clear of rail detents. Base reversal is
@@ -1553,7 +1553,7 @@ def make_task_plan(
                 "open",
                 1.6,
                 phase=TaskPhase.REMOVE_OLD_SERVER,
-                aux_ctrl=aux_at_rack,
+                base_target=base_at_rack,
             )
         )
     for side in ARM_PREFIXES:
@@ -1564,7 +1564,7 @@ def make_task_plan(
                 "open",
                 0.8,
                 phase=TaskPhase.REMOVE_OLD_SERVER,
-                aux_ctrl=aux_at_rack,
+                base_target=base_at_rack,
             )
         )
     # Activate BOTH grasp welds + deactivate SERVER_IN_RACK on a single step.
@@ -1577,7 +1577,7 @@ def make_task_plan(
             "closed",
             0.6,
             phase=TaskPhase.REMOVE_OLD_SERVER,
-            aux_ctrl=aux_at_rack,
+            base_target=base_at_rack,
             attach_activate=(server_grasp[ArmSide.LEFT],),
             attach_deactivate=(AttachmentWeldName.SERVER_IN_RACK,),
         )
@@ -1589,7 +1589,7 @@ def make_task_plan(
             "closed",
             0.6,
             phase=TaskPhase.REMOVE_OLD_SERVER,
-            aux_ctrl=aux_at_rack,
+            base_target=base_at_rack,
         )
     )
     for side in ARM_PREFIXES:
@@ -1600,7 +1600,7 @@ def make_task_plan(
                 "closed",
                 1.2,
                 phase=TaskPhase.REMOVE_OLD_SERVER,
-                aux_ctrl=aux_at_rack,
+                base_target=base_at_rack,
             )
         )
 
@@ -1616,7 +1616,7 @@ def make_task_plan(
                 "closed",
                 1.6,
                 phase=TaskPhase.BACKUP_FROM_RACK,
-                aux_ctrl=aux_pre_extract,
+                base_target=base_pre_extract,
             )
         )
 
@@ -1630,7 +1630,7 @@ def make_task_plan(
                 "closed",
                 2.4,
                 phase=TaskPhase.TRAVERSE_TO_CART,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
 
@@ -1670,7 +1670,7 @@ def make_task_plan(
                     "open",
                     1.4,
                     phase=TaskPhase.STOW_OLD_SERVER,
-                    aux_ctrl=aux_at_cart,
+                    base_target=base_at_cart,
                     attach_activate_at=(
                         (
                             AttachmentWeldName.SERVER_ON_CART_BOTTOM,
@@ -1693,7 +1693,7 @@ def make_task_plan(
                 "open",
                 1.4,
                 phase=TaskPhase.STOW_OLD_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
     # Soft descent: 1.4 s for the last 5 cm. NEW_LAYOUT.md says "halve
@@ -1707,7 +1707,7 @@ def make_task_plan(
                 "open",
                 1.4,
                 phase=TaskPhase.STOW_OLD_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
     # Pin at the canonical cart pose so the new attachment doesn't snap to
@@ -1720,7 +1720,7 @@ def make_task_plan(
             "open",
             0.6,
             phase=TaskPhase.STOW_OLD_SERVER,
-            aux_ctrl=aux_at_cart,
+            base_target=base_at_cart,
         )
     )
     scripts[ArmSide.RIGHT].append(
@@ -1730,7 +1730,7 @@ def make_task_plan(
             "open",
             0.6,
             phase=TaskPhase.STOW_OLD_SERVER,
-            aux_ctrl=aux_at_cart,
+            base_target=base_at_cart,
         )
     )
     for side in ARM_PREFIXES:
@@ -1741,7 +1741,7 @@ def make_task_plan(
                 "open",
                 1.0,
                 phase=TaskPhase.STOW_OLD_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
 
@@ -1770,7 +1770,7 @@ def make_task_plan(
                 "open",
                 1.4,
                 phase=TaskPhase.RETRIEVE_NEW_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
     for side in ARM_PREFIXES:
@@ -1781,7 +1781,7 @@ def make_task_plan(
                 "open",
                 0.8,
                 phase=TaskPhase.RETRIEVE_NEW_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
     scripts[ArmSide.LEFT].append(
@@ -1791,7 +1791,7 @@ def make_task_plan(
             "closed",
             0.6,
             phase=TaskPhase.RETRIEVE_NEW_SERVER,
-            aux_ctrl=aux_at_cart,
+            base_target=base_at_cart,
             attach_activate=(new_grasp[ArmSide.LEFT],),
             attach_deactivate=(AttachmentWeldName.NEW_ON_CART_TOP,),
         )
@@ -1803,7 +1803,7 @@ def make_task_plan(
             "closed",
             0.6,
             phase=TaskPhase.RETRIEVE_NEW_SERVER,
-            aux_ctrl=aux_at_cart,
+            base_target=base_at_cart,
         )
     )
     for side in ARM_PREFIXES:
@@ -1814,7 +1814,7 @@ def make_task_plan(
                 "closed",
                 1.0,
                 phase=TaskPhase.RETRIEVE_NEW_SERVER,
-                aux_ctrl=aux_at_cart,
+                base_target=base_at_cart,
             )
         )
 
@@ -1831,7 +1831,7 @@ def make_task_plan(
                     "closed",
                     2.4,
                     phase=TaskPhase.TRAVERSE_TO_RACK,
-                    aux_ctrl=aux_at_rack,
+                    base_target=base_at_rack,
                     attach_activate_at=(
                         (
                             AttachmentWeldName.NEW_IN_RACK,
@@ -1854,7 +1854,7 @@ def make_task_plan(
                 "closed",
                 2.4,
                 phase=TaskPhase.TRAVERSE_TO_RACK,
-                aux_ctrl=aux_at_rack,
+                base_target=base_at_rack,
             )
         )
 
@@ -1869,7 +1869,7 @@ def make_task_plan(
                 "closed",
                 1.4,
                 phase=TaskPhase.ADVANCE_INTO_RACK,
-                aux_ctrl=aux_at_insert,
+                base_target=base_at_insert,
             )
         )
 
@@ -1894,7 +1894,7 @@ def make_task_plan(
                 "open",
                 2.0,
                 phase=TaskPhase.INSTALL_NEW_SERVER,
-                aux_ctrl=aux_at_insert,
+                base_target=base_at_insert,
             )
         )
     scripts[ArmSide.LEFT].append(
@@ -1904,7 +1904,7 @@ def make_task_plan(
             "open",
             0.6,
             phase=TaskPhase.INSTALL_NEW_SERVER,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     scripts[ArmSide.RIGHT].append(
@@ -1914,7 +1914,7 @@ def make_task_plan(
             "open",
             0.6,
             phase=TaskPhase.INSTALL_NEW_SERVER,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     for side in ARM_PREFIXES:
@@ -1925,7 +1925,7 @@ def make_task_plan(
                 "open",
                 1.0,
                 phase=TaskPhase.INSTALL_NEW_SERVER,
-                aux_ctrl=aux_at_insert,
+                base_target=base_at_insert,
             )
         )
 
@@ -1939,7 +1939,7 @@ def make_task_plan(
             "open",
             1.0,
             phase=TaskPhase.RESET,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     scripts[ArmSide.RIGHT].append(
@@ -1949,7 +1949,7 @@ def make_task_plan(
             "open",
             1.0,
             phase=TaskPhase.RESET,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     scripts[ArmSide.LEFT].append(
@@ -1959,7 +1959,7 @@ def make_task_plan(
             "open",
             1.0,
             phase=TaskPhase.RESET,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     scripts[ArmSide.RIGHT].append(
@@ -1969,7 +1969,7 @@ def make_task_plan(
             "open",
             1.0,
             phase=TaskPhase.RESET,
-            aux_ctrl=aux_at_insert,
+            base_target=base_at_insert,
         )
     )
     for side in ARM_PREFIXES:
@@ -1980,7 +1980,7 @@ def make_task_plan(
                 "open",
                 1.6,
                 phase=TaskPhase.RESET,
-                aux_ctrl=aux_at_rack,
+                base_target=base_at_rack,
             )
         )
 

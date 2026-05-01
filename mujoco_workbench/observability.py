@@ -166,7 +166,14 @@ def phase_state_to_json_dict(state: PhaseState) -> dict[str, Any]:
         "description": state.description,
         "active_attachments": [str(name) for name in state.active_attachments],
         "inactive_attachments": [str(name) for name in state.inactive_attachments],
-        "base_aux": [{"name": str(name), "value": value} for name, value in state.base_aux],
+        "base_target": (
+            {"x": state.base_target.x, "y": state.base_target.y, "yaw": state.base_target.yaw}
+            if state.base_target is not None
+            else None
+        ),
+        "lift_target": (
+            {"position": state.lift_target.position} if state.lift_target is not None else None
+        ),
         "expected_grippable_poses": [
             {
                 "name": pose.name,
@@ -247,7 +254,8 @@ def check_phase_state(
             expected_active=False,
         )
     )
-    failures.extend(_check_base_aux_expectations(model, data, phase_state, base_tolerance))
+    failures.extend(_check_base_target_expectation(model, data, phase_state, base_tolerance))
+    failures.extend(_check_lift_target_expectation(model, data, phase_state, base_tolerance))
     failures.extend(
         _check_grippable_pose_expectations(model, data, phase_state.expected_grippable_poses)
     )
@@ -363,41 +371,86 @@ def _check_attachment_expectations(
     return tuple(failures)
 
 
-def _check_base_aux_expectations(
+def _check_named_joint_value(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    kind: str,
+    name: str,
+    expected_value: float,
+    tolerance: float,
+) -> tuple[ContractFailure, ...]:
+    qpos_address = _resolve_joint_qpos_address(model, name)
+    if qpos_address is None:
+        return (
+            ContractFailure(
+                kind=kind,
+                name=name,
+                expected=float(expected_value),
+                observed="missing",
+                message=f"{kind} joint/actuator {name} does not exist",
+            ),
+        )
+    observed_value = float(data.qpos[qpos_address])
+    if abs(observed_value - float(expected_value)) > tolerance:
+        return (
+            ContractFailure(
+                kind=kind,
+                name=name,
+                expected=float(expected_value),
+                observed=observed_value,
+                message=(
+                    f"{kind} value {name} expected "
+                    f"{float(expected_value):+.4f}, observed {observed_value:+.4f}"
+                ),
+            ),
+        )
+    return ()
+
+
+def _check_base_target_expectation(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     phase_state: PhaseState,
     base_tolerance: float,
 ) -> tuple[ContractFailure, ...]:
+    if phase_state.base_target is None:
+        return ()
     failures: list[ContractFailure] = []
-    for joint_or_actuator_name, expected_value in phase_state.base_aux:
-        qpos_address = _resolve_joint_qpos_address(model, str(joint_or_actuator_name))
-        if qpos_address is None:
-            failures.append(
-                ContractFailure(
-                    kind="base_aux",
-                    name=str(joint_or_actuator_name),
-                    expected=float(expected_value),
-                    observed="missing",
-                    message=f"base joint/actuator {joint_or_actuator_name!s} does not exist",
-                )
+    for name, expected_value in zip(
+        ("base_x", "base_y", "base_yaw"),
+        phase_state.base_target.as_tuple(),
+        strict=True,
+    ):
+        failures.extend(
+            _check_named_joint_value(
+                model,
+                data,
+                kind="base_target",
+                name=name,
+                expected_value=expected_value,
+                tolerance=base_tolerance,
             )
-            continue
-        observed_value = float(data.qpos[qpos_address])
-        if abs(observed_value - float(expected_value)) > base_tolerance:
-            failures.append(
-                ContractFailure(
-                    kind="base_aux",
-                    name=str(joint_or_actuator_name),
-                    expected=float(expected_value),
-                    observed=observed_value,
-                    message=(
-                        f"base value {joint_or_actuator_name!s} expected "
-                        f"{float(expected_value):+.4f}, observed {observed_value:+.4f}"
-                    ),
-                )
-            )
+        )
     return tuple(failures)
+
+
+def _check_lift_target_expectation(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    phase_state: PhaseState,
+    base_tolerance: float,
+) -> tuple[ContractFailure, ...]:
+    if phase_state.lift_target is None:
+        return ()
+    return _check_named_joint_value(
+        model,
+        data,
+        kind="lift_target",
+        name="lift",
+        expected_value=phase_state.lift_target.position,
+        tolerance=base_tolerance,
+    )
 
 
 def _resolve_joint_qpos_address(model: mujoco.MjModel, name: str) -> int | None:

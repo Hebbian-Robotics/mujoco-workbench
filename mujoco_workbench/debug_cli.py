@@ -75,6 +75,7 @@ from mujoco_workbench.runtime import (
     parse_video_format,
     parse_world_point,
     render_frame,
+    resolve_timeline_actuator_maps,
 )
 from mujoco_workbench.scene_base import PhaseContract, PhaseState, Step, TaskPhase
 
@@ -281,13 +282,20 @@ def _advance_context(
         return actual_timeline_state
     if ctx.task_plan is None:
         raise typer.BadParameter(f"scene {ctx.scene.display_name!r} has no make_task_plan")
+    timeline_actuators = resolve_timeline_actuator_maps(ctx.model, ctx.scene)
     advance_timeline_with_state(
         ctx.model,
         ctx.data,
         ctx.arms,
         ctx.task_plan,
         actual_timeline_state,
-        _aux_name_to_id(ctx),
+        timeline_actuators.base_name_to_id,
+        timeline_actuators.base_qposadr,
+        timeline_actuators.base_dofadr,
+        timeline_actuators.lift_name_to_id,
+        timeline_actuators.lift_qposadr,
+        timeline_actuators.lift_dofadr,
+        timeline_actuators.aux_name_to_id,
         ctx.cube_body_ids,
         float(ctx.model.opt.timestep),
         Seconds(duration_s),
@@ -396,6 +404,7 @@ def _clearance_pair_is_interesting(
         frozenset(("left_arm", "grippable")),
         frozenset(("right_arm", "grippable")),
         frozenset(("grippable", "static")),
+        frozenset(("other_dynamic", "static")),
     }
 
 
@@ -454,6 +463,12 @@ def _geom_signed_distance(
         aabb_a = _clearance_aabb_for_geom(model, data, geom_a_id)
         aabb_b = _clearance_aabb_for_geom(model, data, geom_b_id)
         return _aabb_signed_distance(aabb_a, aabb_b)
+
+
+def _clearance_distance_is_reportable(distance_m: float, max_distance_m: float) -> bool:
+    if max_distance_m == 0.0:
+        return distance_m < 0.0
+    return distance_m <= max_distance_m
 
 
 def _clearance_aabb_arrays_for_geoms(
@@ -609,10 +624,7 @@ def snapshot(
         raise typer.BadParameter(
             f"scene {scene!r} has no make_task_plan — sequence mode needs a timeline"
         )
-    aux_name_to_id = {
-        name: mujoco.mj_name2id(ctx.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        for name in ctx.scene.aux_actuator_names
-    }
+    timeline_actuators = resolve_timeline_actuator_maps(ctx.model, ctx.scene)
     sim_dt = float(ctx.model.opt.timestep)
     prev_t = 0.0
     timeline_state = make_timeline_state(ctx.data, ctx.arms)
@@ -626,7 +638,13 @@ def snapshot(
                 ctx.arms,
                 ctx.task_plan,
                 timeline_state,
-                aux_name_to_id,
+                timeline_actuators.base_name_to_id,
+                timeline_actuators.base_qposadr,
+                timeline_actuators.base_dofadr,
+                timeline_actuators.lift_name_to_id,
+                timeline_actuators.lift_qposadr,
+                timeline_actuators.lift_dofadr,
+                timeline_actuators.aux_name_to_id,
                 ctx.cube_body_ids,
                 sim_dt,
                 Seconds(dt),
@@ -913,8 +931,11 @@ def clearance(
     ] = 0.05,
     max_distance: Annotated[
         float,
-        typer.Option("--max-distance", help="distance threshold to report, in metres"),
-    ] = 0.02,
+        typer.Option(
+            "--max-distance",
+            help="distance threshold to report, in metres; 0 reports overlaps only",
+        ),
+    ] = 0.0,
     fail_below: Annotated[
         float,
         typer.Option("--fail-below", help="exit non-zero if any reported pair is below this"),
@@ -925,7 +946,7 @@ def clearance(
             "--exact-geom/--aabb-only",
             help="use MuJoCo geom distance after the AABB broadphase",
         ),
-    ] = False,
+    ] = True,
     top: Annotated[int, typer.Option("--top", help="number of worst geom pairs to print")] = 25,
 ) -> None:
     """Replay a scripted scene and report arm/object clearance problems."""
@@ -991,9 +1012,9 @@ def clearance(
                     ctx.data,
                     geom_a.geom_id,
                     geom_b.geom_id,
-                    max_distance_m=max_distance,
+                    max_distance_m=max(max_distance, 0.02),
                 )
-            if distance_m > max_distance:
+            if not _clearance_distance_is_reportable(distance_m, max_distance):
                 continue
             previous = worst_by_pair.get(pair_key)
             if previous is None or distance_m < previous.distance_m:
@@ -1127,8 +1148,15 @@ def _format_phase_state_facts(state: PhaseState) -> str:
         parts.append("active=" + ",".join(str(name) for name in state.active_attachments))
     if state.inactive_attachments:
         parts.append("inactive=" + ",".join(str(name) for name in state.inactive_attachments))
-    if state.base_aux:
-        parts.append("base=" + ",".join(f"{name}:{value:+.2f}" for name, value in state.base_aux))
+    if state.base_target is not None:
+        parts.append(
+            "base="
+            f"x:{state.base_target.x:+.2f},"
+            f"y:{state.base_target.y:+.2f},"
+            f"yaw:{state.base_target.yaw:+.2f}"
+        )
+    if state.lift_target is not None:
+        parts.append(f"lift={state.lift_target.position:+.2f}")
     return " | ".join(parts)
 
 
@@ -1672,10 +1700,7 @@ def review(
     ctx = build_scene_and_advance(scene, Seconds(0.0))
     if ctx.task_plan is None:
         raise typer.BadParameter(f"scene {scene!r} has no make_task_plan")
-    aux_name_to_id = {
-        name: mujoco.mj_name2id(ctx.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        for name in ctx.scene.aux_actuator_names
-    }
+    timeline_actuators = resolve_timeline_actuator_maps(ctx.model, ctx.scene)
     sim_dt = float(ctx.model.opt.timestep)
     prev_t = 0.0
     timeline_state = make_timeline_state(ctx.data, ctx.arms)
@@ -1689,7 +1714,13 @@ def review(
                 ctx.arms,
                 ctx.task_plan,
                 timeline_state,
-                aux_name_to_id,
+                timeline_actuators.base_name_to_id,
+                timeline_actuators.base_qposadr,
+                timeline_actuators.base_dofadr,
+                timeline_actuators.lift_name_to_id,
+                timeline_actuators.lift_qposadr,
+                timeline_actuators.lift_dofadr,
+                timeline_actuators.aux_name_to_id,
                 ctx.cube_body_ids,
                 sim_dt,
                 Seconds(dt),
@@ -1719,10 +1750,7 @@ def review(
     ctx = build_scene_and_advance(scene, Seconds(0.0))  # reset sim for clean advance
     if ctx.task_plan is None:
         raise typer.BadParameter(f"scene {scene!r} has no make_task_plan")
-    aux_name_to_id = {
-        name: mujoco.mj_name2id(ctx.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        for name in ctx.scene.aux_actuator_names
-    }
+    timeline_actuators = resolve_timeline_actuator_maps(ctx.model, ctx.scene)
     sim_dt = float(ctx.model.opt.timestep)
     video_task_plan = ctx.task_plan
     prev_t = 0.0
@@ -1738,7 +1766,13 @@ def review(
                 ctx.arms,
                 video_task_plan,
                 timeline_state,
-                aux_name_to_id,
+                timeline_actuators.base_name_to_id,
+                timeline_actuators.base_qposadr,
+                timeline_actuators.base_dofadr,
+                timeline_actuators.lift_name_to_id,
+                timeline_actuators.lift_qposadr,
+                timeline_actuators.lift_dofadr,
+                timeline_actuators.aux_name_to_id,
                 ctx.cube_body_ids,
                 sim_dt,
                 Seconds(dt),

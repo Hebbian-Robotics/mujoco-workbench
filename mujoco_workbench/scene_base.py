@@ -3,8 +3,9 @@
 Every scene module is expected to expose, at module level:
 
     NAME: str                       # display name used in the Viser GUI
-    ARM_PREFIXES: tuple[str, ...]   # prefix strings identifying arms in the model
-                                    #   (empty tuple for scenes with no articulated arm)
+    ARM_PREFIXES: tuple[str, ...]   # legacy left/right arm prefixes
+    # New scenes may prefer MANIPULATORS: tuple[ManipulatorSpec, ...] for
+    # per-arm robot-kind declarations.
     N_CUBES: int                    # number of grippable objects (0 if no grasp)
 
     def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
@@ -42,7 +43,17 @@ Scripted scenes may also expose:
         Debug tooling uses these to write snapshots and fail fast when a
         phase leaves attachments or base joints in the wrong state.
 
-The runner introspects the module, so either (or both) can be absent.
+    BASE_ACTUATOR_NAMES: tuple[str, ...]
+        Optional mobile-base actuator names. New scenes should declare these
+        separately from generic AUX_ACTUATOR_NAMES so diagnostics can understand
+        that the scene has a mobile base while the supported topology stays
+        restricted to unimanual or bimanual mobile manipulation.
+
+    LIFT_ACTUATOR_NAME: str
+        Optional vertical lift or torso actuator name. Scenes drive it through
+        Step.lift_target rather than Step.aux_ctrl.
+
+The runner introspects the module, so these optional declarations can be absent.
 """
 
 from __future__ import annotations
@@ -91,6 +102,30 @@ class TaskPhase(StrEnum):
     RETRACT = "retract"
 
 
+@dataclass(frozen=True)
+class MobileBaseTarget:
+    """Planar mobile-base pose target.
+
+    This intentionally models chassis motion only. Torso/lift joints are a
+    separate component because they change manipulator reach rather than the
+    robot's world-frame footprint.
+    """
+
+    x: float
+    y: float
+    yaw: float
+
+    def as_tuple(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.yaw)
+
+
+@dataclass(frozen=True)
+class LiftTarget:
+    """Vertical lift/torso target for robots equipped with one."""
+
+    position: float
+
+
 # Bounded index into a scene's grippable-object list. Construct via
 # `make_cube_id` so the bound check lives in one place; downstream code
 # (runner, Step) accepts it without re-checking.
@@ -109,7 +144,7 @@ class Step:
     """A single waypoint in a per-arm timeline."""
 
     label: str
-    arm_q: JointConfig
+    arm_q: np.ndarray
     gripper: GripperState
     duration: float  # seconds at speed 1.0
     phase: TaskPhase = TaskPhase.UNPHASED
@@ -149,9 +184,13 @@ class Step:
         | None
     ) = None
 
-    # Scene-owned actuator targets (e.g. a lift prismatic). Keys are actuator
-    # names declared via `AUX_ACTUATOR_NAMES`; runner interpolates to these
-    # alongside arm joints. StrEnum-as-str: scenes may pass enum members.
+    # First-class non-arm components. `base_target` drives planar chassis
+    # movement; `lift_target` drives a vertical lift/torso joint when present.
+    base_target: MobileBaseTarget | None = None
+    lift_target: LiftTarget | None = None
+    # Remaining scene-owned actuator targets that do not fit the manipulator,
+    # planar base, or lift components. Keys are actuator names declared via
+    # `AUX_ACTUATOR_NAMES`; StrEnum-as-str scenes may pass enum members.
     aux_ctrl: Mapping[Any, float] | None = None
 
     # On entry to this step, set each named geom's RGBA. Pairs are
@@ -163,12 +202,11 @@ class Step:
     set_geom_rgba: tuple[tuple[str, tuple[float, float, float, float]], ...] = ()
 
     def __post_init__(self) -> None:
-        # arm_q's shape invariant can't be expressed in the type system, so
-        # check it at construction. Other fields are guarded by Literal /
-        # `make_cube_id` already.
+        # Robot-specific length is checked after scene loading, once the
+        # manipulator adapter has refined the expected joint count.
         self.arm_q = np.asarray(self.arm_q, dtype=float)
-        if self.arm_q.shape != (6,):
-            raise ValueError(f"arm_q must be length 6, got shape {self.arm_q.shape}")
+        if self.arm_q.ndim != 1:
+            raise ValueError(f"arm_q must be a 1D joint vector, got shape {self.arm_q.shape}")
 
 
 @dataclass(frozen=True)
@@ -200,7 +238,8 @@ class PhaseState:
     description: str
     active_attachments: tuple[str, ...] = ()
     inactive_attachments: tuple[str, ...] = ()
-    base_aux: tuple[tuple[str, float], ...] = ()
+    base_target: MobileBaseTarget | None = None
+    lift_target: LiftTarget | None = None
     expected_grippable_poses: tuple[GrippablePoseExpectation, ...] = ()
 
 

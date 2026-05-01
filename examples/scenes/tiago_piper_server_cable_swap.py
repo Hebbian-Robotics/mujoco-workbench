@@ -17,8 +17,9 @@ base parked in front of a rack. The task plan runs through a full server swap:
 Novel in this scene compared to sink_bimanual:
   * Pipers attached inside a nested body (lift_carriage) so a slide joint
     raises/lowers arms + onboard compartments together.
-  * Scene-owned actuator ("lift") controlled via Step.aux_ctrl; IK freezes it
-    via `locked_joint_names=("lift",)` so the solver uses only the arm chain.
+  * Planar base and torso lift are first-class timeline components, controlled
+    through `Step.base_target` and `Step.lift_target`; IK freezes those joints
+    so the solver uses only the arm chain.
   * Cable objects: 7-segment ball-jointed chains anchored to the rack,
     terminating in a grippable connector block. Grasp the head to pull out.
   * Three port shapes + colors (power/net/fiber) for visual distinction.
@@ -29,7 +30,7 @@ Type-safety conventions:
     `build_spec`, `_resolve_scene_ids`, and `apply_initial_state` — no more
     three-way duplication of the same name list with the same active flags.
   * Weld names are `AttachmentWeldName` (StrEnum) so typos are caught by ty.
-  * Aux actuator keys are `DataCenterAux` (StrEnum) for the same reason.
+  * Base/lift actuator keys are StrEnums for the same reason.
   * Grippable objects are addressed by `CubeID` constructed through
     `grippable_id("cable1_connector")` — the bounds check and the name-to-index
     translation happen in one place, instead of scattered `_index_of(f"...")`
@@ -39,7 +40,7 @@ Type-safety conventions:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -56,7 +57,15 @@ from mujoco_workbench.arm_handles import ArmHandles, ArmSide
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.ik import PositionOnly, solve_ik
 from mujoco_workbench.placement import camera_xyaxes_for_look_at, standoff_position
-from mujoco_workbench.scene_base import CubeID, GripperState, Position3, Step, make_cube_id
+from mujoco_workbench.scene_base import (
+    CubeID,
+    GripperState,
+    LiftTarget,
+    MobileBaseTarget,
+    Position3,
+    Step,
+    make_cube_id,
+)
 from mujoco_workbench.scene_check import (
     AttachmentConstraint,
     CameraInvariant,
@@ -72,9 +81,9 @@ NAME = "tiago_piper_server_cable_swap"
 # convention. The legacy TIAGo+Piper scene stays on the original
 # Piper 8-joint qpos layout.
 ROBOT_KIND = "piper"
-# Joints the IK solver must lock — TIAGo's torso lift is non-arm and
-# moves under aux control; locking it lets mink optimise only the
-# 6-DOF Piper arm chain.
+# Joints the IK solver must lock — TIAGo's torso lift is non-arm and moves as a
+# timeline lift component; locking it lets mink optimise only the 6-DOF Piper
+# arm chain.
 IK_LOCKED_JOINT_NAMES: tuple[str, ...] = ("torso_lift_joint",)
 ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
 RACK_HANDLE_APPROACH_M = 0.07
@@ -95,28 +104,34 @@ GRIPPABLES: tuple[str, ...] = (
 N_CUBES = len(GRIPPABLES)  # runner uses this to size ArmHandles.weld_ids
 
 
-class DataCenterAux(StrEnum):
-    """Scene-owned (non-arm) actuators addressable via Step.aux_ctrl.
+class DataCenterBaseActuator(StrEnum):
+    """Planar mobile-base actuators added by `load_tiago`."""
 
-    `LIFT` maps directly to PAL TIAGo's upstream `torso_lift_joint` name so the
-    scene's aux-ctrl dispatch reaches the joint Menagerie already declares in
-    tiago.xml (we add only a position actuator on top).
-
-    `BASE_X` / `BASE_Y` / `BASE_YAW` drive the 3-DOF planar joint
-    `examples.robots.tiago.load_tiago` adds at `base_link`. Used by the carry
-    choreography so the robot can step back, rotate to face the cart,
-    place the server, and rotate back — all via puppet-mode qpos
-    writes. mink IK locks these three joints so the planner uses only
-    the arm chain.
-    """
-
-    LIFT = "torso_lift_joint"
     BASE_X = "base_x"
     BASE_Y = "base_y"
     BASE_YAW = "base_yaw"
 
 
-AUX_ACTUATOR_NAMES: tuple[str, ...] = tuple(m.value for m in DataCenterAux)
+class DataCenterLiftActuator(StrEnum):
+    """Vertical torso lift actuator added on top of Menagerie's TIAGo joint."""
+
+    LIFT = "torso_lift_joint"
+
+
+AUX_ACTUATOR_NAMES: tuple[str, ...] = ()
+BASE_ACTUATOR_NAMES: tuple[str, ...] = (
+    DataCenterBaseActuator.BASE_X.value,
+    DataCenterBaseActuator.BASE_Y.value,
+    DataCenterBaseActuator.BASE_YAW.value,
+)
+LIFT_ACTUATOR_NAME = DataCenterLiftActuator.LIFT.value
+
+
+@dataclass(frozen=True)
+class BaseAndLiftTarget:
+    base: MobileBaseTarget
+    lift: LiftTarget
+
 
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (
     ("forward_cam", CameraRole.TOP),
@@ -992,8 +1007,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # for a possible PD-mode revert).
     root.actuator.add(
         "position",
-        name=DataCenterAux.LIFT,
-        joint=DataCenterAux.LIFT,
+        name=DataCenterLiftActuator.LIFT,
+        joint=DataCenterLiftActuator.LIFT,
         kp=80000.0,
         kv=800.0,
         ctrllimited="true",
@@ -1005,8 +1020,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # well off-axis from the rack without saturating.
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_X,
-        joint=DataCenterAux.BASE_X,
+        name=DataCenterBaseActuator.BASE_X,
+        joint=DataCenterBaseActuator.BASE_X,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -1014,8 +1029,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_Y,
-        joint=DataCenterAux.BASE_Y,
+        name=DataCenterBaseActuator.BASE_Y,
+        joint=DataCenterBaseActuator.BASE_Y,
         kp=20000.0,
         kv=400.0,
         ctrllimited="true",
@@ -1023,8 +1038,8 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     )
     root.actuator.add(
         "position",
-        name=DataCenterAux.BASE_YAW,
-        joint=DataCenterAux.BASE_YAW,
+        name=DataCenterBaseActuator.BASE_YAW,
+        joint=DataCenterBaseActuator.BASE_YAW,
         kp=8000.0,
         kv=200.0,
         ctrllimited="true",
@@ -1132,7 +1147,9 @@ def _resolve_scene_ids(model: mujoco.MjModel) -> _SceneIds:
         return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, name)
 
     return _SceneIds(
-        lift_actuator_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, DataCenterAux.LIFT),
+        lift_actuator_id=mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_ACTUATOR, DataCenterLiftActuator.LIFT
+        ),
         server_body_id=body("server"),
         new_server_body_id=body("new_server"),
         rack_body_id=body("rack_frame"),
@@ -1172,11 +1189,15 @@ def apply_initial_state(
             data.eq_active[eq_id] = 0
     # Lift at home
     data.ctrl[ids.lift_actuator_id] = LAYOUT.lift.home
-    lift_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.LIFT)
+    lift_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterLiftActuator.LIFT)
     data.qpos[model.jnt_qposadr[lift_jnt]] = LAYOUT.lift.home
     # Planar base at origin (x=0, y=0, yaw=0). The carry choreography
     # animates these via aux_ctrl during the cart sequence.
-    for jname in (DataCenterAux.BASE_X, DataCenterAux.BASE_Y, DataCenterAux.BASE_YAW):
+    for jname in (
+        DataCenterBaseActuator.BASE_X,
+        DataCenterBaseActuator.BASE_Y,
+        DataCenterBaseActuator.BASE_YAW,
+    ):
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
         data.qpos[model.jnt_qposadr[jid]] = 0.0
         data.qvel[model.jnt_dofadr[jid]] = 0.0
@@ -1257,10 +1278,10 @@ def _snap_factory(
             # world-frame target by sliding/rotating the whole robot,
             # which produces plans that don't match what runtime delivers.
             locked_joint_names=(
-                DataCenterAux.LIFT,
-                DataCenterAux.BASE_X,
-                DataCenterAux.BASE_Y,
-                DataCenterAux.BASE_YAW,
+                DataCenterLiftActuator.LIFT,
+                DataCenterBaseActuator.BASE_X,
+                DataCenterBaseActuator.BASE_Y,
+                DataCenterBaseActuator.BASE_YAW,
             ),
             # DAQP over ProxQP: ProxQP raises NoSolutionFound on some of the
             # long-reach TIAGo-mounted targets — DAQP finds a feasible solve
@@ -1321,12 +1342,12 @@ def make_task_plan(
         following step releases the grasp.
     """
     scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_PREFIXES}
-    lift_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.LIFT)
+    lift_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterLiftActuator.LIFT)
 
     def push_both(
         label: str,
         duration: float,
-        aux: Mapping[Any, float] | None = None,
+        target: BaseAndLiftTarget | None = None,
         gripper: GripperState = "closed",
     ) -> None:
         for side in ARM_PREFIXES:
@@ -1336,7 +1357,8 @@ def make_task_plan(
                     arm_q=HOME_ARM_Q.copy(),
                     gripper=gripper,
                     duration=duration,
-                    aux_ctrl=aux,
+                    base_target=target.base if target is not None else None,
+                    lift_target=target.lift if target is not None else None,
                 )
             )
 
@@ -1344,7 +1366,7 @@ def make_task_plan(
         other_side: ArmSide,
         label_prefix: str,
         durations: list[float],
-        aux: Mapping[Any, float] | None = None,
+        target: BaseAndLiftTarget | None = None,
     ) -> None:
         """Append matching idle-at-home steps on the other arm's timeline."""
         for i, d in enumerate(durations):
@@ -1354,13 +1376,16 @@ def make_task_plan(
                     arm_q=HOME_ARM_Q.copy(),
                     gripper="open",
                     duration=d,
-                    aux_ctrl=aux,
+                    base_target=target.base if target is not None else None,
+                    lift_target=target.lift if target is not None else None,
                 )
             )
 
-    base_x_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_X)
-    base_y_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_Y)
-    base_yaw_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterAux.BASE_YAW)
+    base_x_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_X)
+    base_y_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_Y)
+    base_yaw_jnt = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterBaseActuator.BASE_YAW
+    )
 
     def seed_at_lift(
         lift_qpos: float,
@@ -1397,9 +1422,17 @@ def make_task_plan(
     # when the first approach step began, so the arm landed above the actual
     # cable position. Bumping the ramp duration to 3 s plus a 1 s hold gives
     # the physical lift time to catch up with ctrl before arms start moving.
-    push_both("home", 1.0, aux={DataCenterAux.LIFT: LAYOUT.lift.home})
-    push_both("lift to cables", 3.0, aux={DataCenterAux.LIFT: LAYOUT.lift.cables})
-    push_both("settle at cables", 1.0, aux={DataCenterAux.LIFT: LAYOUT.lift.cables})
+    target_home = BaseAndLiftTarget(
+        base=MobileBaseTarget(x=0.0, y=0.0, yaw=0.0),
+        lift=LiftTarget(position=LAYOUT.lift.home),
+    )
+    target_cables = BaseAndLiftTarget(
+        base=MobileBaseTarget(x=0.0, y=0.0, yaw=0.0),
+        lift=LiftTarget(position=LAYOUT.lift.cables),
+    )
+    push_both("home", 1.0, target=target_home)
+    push_both("lift to cables", 3.0, target=target_cables)
+    push_both("settle at cables", 1.0, target=target_cables)
 
     # Port → its "*_old" and "*_new" attachment welds. Indexed by port_idx.
     _PORT_OLD = (
@@ -1453,7 +1486,7 @@ def make_task_plan(
         q_at, _ = snap(at_conn)
         q_pulled, _ = snap(pulled)
 
-        aux = {DataCenterAux.LIFT: LAYOUT.lift.cables}
+        cable_service_target = target_cables
         # Step durations include dedicated settle time before grip: the
         # piper PD with its stock ±100 N·m forcerange takes ~1.5 s to
         # converge from a 1-rad-magnitude step change against the arm's
@@ -1462,24 +1495,47 @@ def make_task_plan(
         # would weld the connector 3-5 cm off-centre and then drag it
         # around at that offset for the rest of the sequence.
         active_steps = [
-            Step(f"approach c{port_idx + 1}", q_approach, "open", 2.0, aux_ctrl=aux),
-            Step(f"at connector c{port_idx + 1}", q_at, "open", 1.6, aux_ctrl=aux),
+            Step(
+                f"approach c{port_idx + 1}",
+                q_approach,
+                "open",
+                2.0,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
+            ),
+            Step(
+                f"at connector c{port_idx + 1}",
+                q_at,
+                "open",
+                1.6,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
+            ),
             Step(
                 f"grip + unplug c{port_idx + 1}",
                 q_at,
                 "closed",
                 0.5,
-                aux_ctrl=aux,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
                 attach_activate=(cable_grasp_weld,),
                 attach_deactivate=(port_weld,),
             ),
-            Step(f"pull c{port_idx + 1} free", q_pulled, "closed", 1.0, aux_ctrl=aux),
+            Step(
+                f"pull c{port_idx + 1} free",
+                q_pulled,
+                "closed",
+                1.0,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
+            ),
             Step(
                 f"release c{port_idx + 1}",
                 q_pulled,
                 "open",
                 0.4,
-                aux_ctrl=aux,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
                 attach_deactivate=(cable_grasp_weld,),
             ),
         ]
@@ -1488,7 +1544,7 @@ def make_task_plan(
             _other_side(active_side),
             f"wait c{port_idx + 1}",
             [s.duration for s in active_steps],
-            aux=aux,
+            target=cable_service_target,
         )
 
     plan_unplug(0, ArmSide.LEFT)
@@ -1541,23 +1597,25 @@ def make_task_plan(
     BASE_AT_CART_Y = -0.35  # robot 30 cm north of cart, facing it
     YAW_TO_CART = -math.pi / 2.0  # 90° clockwise about +z (face world -y)
 
-    def base_aux(*, lift: float, x: float, y: float, yaw: float) -> dict[str, float]:
-        return {
-            DataCenterAux.LIFT: lift,
-            DataCenterAux.BASE_X: x,
-            DataCenterAux.BASE_Y: y,
-            DataCenterAux.BASE_YAW: yaw,
-        }
+    def base_and_lift_target(*, lift: float, x: float, y: float, yaw: float) -> BaseAndLiftTarget:
+        return BaseAndLiftTarget(
+            base=MobileBaseTarget(x=x, y=y, yaw=yaw),
+            lift=LiftTarget(position=lift),
+        )
 
-    aux_at_rack = base_aux(lift=LAYOUT.lift.server, x=0.0, y=0.0, yaw=0.0)
+    target_at_rack = base_and_lift_target(lift=LAYOUT.lift.server, x=0.0, y=0.0, yaw=0.0)
     # After the pre-extract reverse, the robot stays at this offset
     # through the grip + arm-retract phases.
-    aux_pre_extract = base_aux(lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
-    aux_facing_cart = base_aux(lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=YAW_TO_CART)
-    aux_at_cart = base_aux(
+    target_pre_extract = base_and_lift_target(
+        lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0
+    )
+    target_facing_cart = base_and_lift_target(
+        lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=YAW_TO_CART
+    )
+    target_at_cart = base_and_lift_target(
         lift=LAYOUT.lift.server, x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART
     )
-    aux_at_cart_low = base_aux(
+    target_at_cart_low = base_and_lift_target(
         lift=LAYOUT.lift.stow, x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART
     )
 
@@ -1616,16 +1674,32 @@ def make_task_plan(
                 HOME_ARM_Q.copy(),
                 "closed",
                 1.2,
-                aux_ctrl=aux_pre_extract,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
             ),
-            Step("to handle L", qL_app, "open", 1.8, aux_ctrl=aux_pre_extract),
-            Step("at handle L", qL_at, "open", 0.8, aux_ctrl=aux_pre_extract),
+            Step(
+                "to handle L",
+                qL_app,
+                "open",
+                1.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
+            Step(
+                "at handle L",
+                qL_at,
+                "open",
+                0.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
             Step(
                 "grip server L",
                 qL_at,
                 "closed",
                 0.6,
-                aux_ctrl=aux_pre_extract,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
                 attach_activate=(grasp_L,),
                 attach_deactivate=(AttachmentWeldName.SERVER_IN_RACK,),
             ),
@@ -1636,10 +1710,24 @@ def make_task_plan(
             # closes as the elbow flexes. Server slides 40 cm in world
             # -x and is fully clear of the rack opening. Base
             # stationary throughout this phase.
-            Step("pull server out L", qL_out, "closed", 2.8, aux_ctrl=aux_pre_extract),
+            Step(
+                "pull server out L",
+                qL_out,
+                "closed",
+                2.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
             # Rotate body in place to face cart (yaw 0 → -π/2). Arm pose
             # held; server rotates with the robot.
-            Step("rotate to cart", qL_out, "closed", 2.5, aux_ctrl=aux_facing_cart),
+            Step(
+                "rotate to cart",
+                qL_out,
+                "closed",
+                2.5,
+                base_target=target_facing_cart.base,
+                lift_target=target_facing_cart.lift,
+            ),
             # Pin at the start of the cart transfer. Dragging the
             # gripper-welded server through the base slide made the server pass
             # through the cart shelf; the object belongs at the canonical cart
@@ -1649,7 +1737,8 @@ def make_task_plan(
                 qL_out,
                 "open",
                 2.0,
-                aux_ctrl=aux_at_cart,
+                base_target=target_at_cart.base,
+                lift_target=target_at_cart.lift,
                 attach_activate_at=(
                     (
                         AttachmentWeldName.SERVER_ON_CART_BOTTOM,
@@ -1663,13 +1752,21 @@ def make_task_plan(
                 ),
                 attach_deactivate=(grasp_L,),
             ),
-            Step("clear cart after stow L", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_cart),
+            Step(
+                "clear cart after stow L",
+                HOME_ARM_Q.copy(),
+                "open",
+                0.8,
+                base_target=target_at_cart.base,
+                lift_target=target_at_cart.lift,
+            ),
             Step(
                 "lower lift after stow L",
                 HOME_ARM_Q.copy(),
                 "open",
                 1.5,
-                aux_ctrl=aux_at_cart_low,
+                base_target=target_at_cart_low.base,
+                lift_target=target_at_cart_low.lift,
             ),
         ]
     )
@@ -1680,21 +1777,72 @@ def make_task_plan(
                 HOME_ARM_Q.copy(),
                 "closed",
                 1.2,
-                aux_ctrl=aux_pre_extract,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
             ),
-            Step("to handle R", qR_app, "open", 1.8, aux_ctrl=aux_pre_extract),
-            Step("at handle R", qR_at, "open", 0.8, aux_ctrl=aux_pre_extract),
-            Step("hold handle R", qR_at, "open", 0.6, aux_ctrl=aux_pre_extract),
-            Step("pull server out R", qR_out, "open", 2.8, aux_ctrl=aux_pre_extract),
-            Step("rotate R", qR_out, "open", 2.5, aux_ctrl=aux_facing_cart),
-            Step("slide to cart R", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_at_cart),
-            Step("clear cart after stow R", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_cart),
+            Step(
+                "to handle R",
+                qR_app,
+                "open",
+                1.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
+            Step(
+                "at handle R",
+                qR_at,
+                "open",
+                0.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
+            Step(
+                "hold handle R",
+                qR_at,
+                "open",
+                0.6,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
+            Step(
+                "pull server out R",
+                qR_out,
+                "open",
+                2.8,
+                base_target=target_pre_extract.base,
+                lift_target=target_pre_extract.lift,
+            ),
+            Step(
+                "rotate R",
+                qR_out,
+                "open",
+                2.5,
+                base_target=target_facing_cart.base,
+                lift_target=target_facing_cart.lift,
+            ),
+            Step(
+                "slide to cart R",
+                HOME_ARM_Q.copy(),
+                "open",
+                2.0,
+                base_target=target_at_cart.base,
+                lift_target=target_at_cart.lift,
+            ),
+            Step(
+                "clear cart after stow R",
+                HOME_ARM_Q.copy(),
+                "open",
+                0.8,
+                base_target=target_at_cart.base,
+                lift_target=target_at_cart.lift,
+            ),
             Step(
                 "lower lift after stow R",
                 HOME_ARM_Q.copy(),
                 "open",
                 1.5,
-                aux_ctrl=aux_at_cart_low,
+                base_target=target_at_cart_low.base,
+                lift_target=target_at_cart_low.lift,
             ),
         ]
     )
@@ -1740,19 +1888,21 @@ def make_task_plan(
     new_server_id = grippable_id("new_server")
     grasp_new_L = grasp_weld(ArmSide.LEFT, new_server_id)
 
-    aux_pick_at_cart = base_aux(
+    target_pick_at_cart = base_and_lift_target(
         lift=LAYOUT.lift.pick_new, x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART
     )
-    aux_carry_at_cart = base_aux(
+    target_carry_at_cart = base_and_lift_target(
         lift=LAYOUT.lift.server, x=BASE_AT_CART_X, y=BASE_AT_CART_Y, yaw=YAW_TO_CART
     )
     # During the new-server install the base mirrors the extract: stays
     # at BASE_PRE_EXTRACT so the same qL_out / qL_at arm poses (solved
     # against that base) describe the slide-in motion symmetrically.
-    aux_carry_facing_cart = base_aux(
+    target_carry_facing_cart = base_and_lift_target(
         lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=YAW_TO_CART
     )
-    aux_carry_back = base_aux(lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0)
+    target_carry_back = base_and_lift_target(
+        lift=LAYOUT.lift.server, x=BASE_PRE_EXTRACT, y=0.0, yaw=0.0
+    )
 
     # Install motion is the mirror of extract: arm starts at qL_out
     # (server held in front of rack) and extends to qL_at (server slid
@@ -1762,23 +1912,59 @@ def make_task_plan(
 
     scripts[ArmSide.LEFT].extend(
         [
-            Step("to cart top L", qL_napp, "open", 1.6, aux_ctrl=aux_pick_at_cart),
-            Step("at cart top L", qL_ngrip, "open", 0.8, aux_ctrl=aux_pick_at_cart),
+            Step(
+                "to cart top L",
+                qL_napp,
+                "open",
+                1.6,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
+            ),
+            Step(
+                "at cart top L",
+                qL_ngrip,
+                "open",
+                0.8,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
+            ),
             Step(
                 "grip new L",
                 qL_ngrip,
                 "closed",
                 0.6,
-                aux_ctrl=aux_pick_at_cart,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
                 attach_activate=(grasp_new_L,),
                 attach_deactivate=(AttachmentWeldName.NEW_ON_CART_TOP,),
             ),
             # Lift up off cart shelf (raise lift, hold arm pose).
-            Step("lift off cart L", qL_ngrip, "closed", 1.5, aux_ctrl=aux_carry_at_cart),
+            Step(
+                "lift off cart L",
+                qL_ngrip,
+                "closed",
+                1.5,
+                base_target=target_carry_at_cart.base,
+                lift_target=target_carry_at_cart.lift,
+            ),
             # Slide back from cart.
-            Step("slide back from cart L", qL_ngrip, "closed", 2.0, aux_ctrl=aux_carry_facing_cart),
+            Step(
+                "slide back from cart L",
+                qL_ngrip,
+                "closed",
+                2.0,
+                base_target=target_carry_facing_cart.base,
+                lift_target=target_carry_facing_cart.lift,
+            ),
             # Rotate back to face rack.
-            Step("rotate to rack L", qL_ngrip, "closed", 2.5, aux_ctrl=aux_carry_back),
+            Step(
+                "rotate to rack L",
+                qL_ngrip,
+                "closed",
+                2.5,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
             # Re-pose arm to "out" — server now held in front of robot,
             # ready to be seated. Pin before the visual slide so the server
             # does not sweep through rack panels during the base/arm transition.
@@ -1787,14 +1973,16 @@ def make_task_plan(
                 qL_out,
                 "closed",
                 1.5,
-                aux_ctrl=aux_carry_back,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
             ),
             Step(
                 "pin new server in rack L",
                 qL_out,
                 "open",
                 0.4,
-                aux_ctrl=aux_carry_back,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
                 attach_activate_at=(
                     (
                         AttachmentWeldName.NEW_IN_RACK,
@@ -1811,32 +1999,124 @@ def make_task_plan(
             # ARM-EXTEND slide-in: TCP traces a horizontal line at constant
             # z=slot_z, moving from "out" (-x) to "at handle" (+x). Server
             # is already pinned in the rack; this is now a visual follow-through.
-            Step("slide into rack L", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_carry_back),
+            Step(
+                "slide into rack L",
+                HOME_ARM_Q.copy(),
+                "open",
+                2.0,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
             # Robot rolls forward to base origin so the slot/server pose
             # matches the canonical world position before the weld pins.
-            Step("roll forward L", HOME_ARM_Q.copy(), "open", 1.0, aux_ctrl=aux_at_rack),
+            Step(
+                "roll forward L",
+                HOME_ARM_Q.copy(),
+                "open",
+                1.0,
+                base_target=target_at_rack.base,
+                lift_target=target_at_rack.lift,
+            ),
             Step(
                 "seat in rack L",
                 HOME_ARM_Q.copy(),
                 "open",
                 0.8,
-                aux_ctrl=aux_at_rack,
+                base_target=target_at_rack.base,
+                lift_target=target_at_rack.lift,
             ),
         ]
     )
     scripts[ArmSide.RIGHT].extend(
         [
-            Step("to cart top R", qR_napp, "open", 1.6, aux_ctrl=aux_pick_at_cart),
-            Step("at cart top R", qR_ngrip, "open", 0.8, aux_ctrl=aux_pick_at_cart),
-            Step("grip new R", qR_ngrip, "open", 0.6, aux_ctrl=aux_pick_at_cart),
-            Step("lift off cart R", qR_ngrip, "open", 1.5, aux_ctrl=aux_carry_at_cart),
-            Step("slide back R2", qR_ngrip, "open", 2.0, aux_ctrl=aux_carry_facing_cart),
-            Step("rotate to rack R", qR_ngrip, "open", 2.5, aux_ctrl=aux_carry_back),
-            Step("ready to insert R", qR_out, "open", 1.5, aux_ctrl=aux_carry_back),
-            Step("pin new server in rack R", qR_out, "open", 0.4, aux_ctrl=aux_carry_back),
-            Step("slide into rack R", HOME_ARM_Q.copy(), "open", 2.0, aux_ctrl=aux_carry_back),
-            Step("roll forward R", HOME_ARM_Q.copy(), "open", 1.0, aux_ctrl=aux_at_rack),
-            Step("seat in rack R", HOME_ARM_Q.copy(), "open", 0.8, aux_ctrl=aux_at_rack),
+            Step(
+                "to cart top R",
+                qR_napp,
+                "open",
+                1.6,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
+            ),
+            Step(
+                "at cart top R",
+                qR_ngrip,
+                "open",
+                0.8,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
+            ),
+            Step(
+                "grip new R",
+                qR_ngrip,
+                "open",
+                0.6,
+                base_target=target_pick_at_cart.base,
+                lift_target=target_pick_at_cart.lift,
+            ),
+            Step(
+                "lift off cart R",
+                qR_ngrip,
+                "open",
+                1.5,
+                base_target=target_carry_at_cart.base,
+                lift_target=target_carry_at_cart.lift,
+            ),
+            Step(
+                "slide back R2",
+                qR_ngrip,
+                "open",
+                2.0,
+                base_target=target_carry_facing_cart.base,
+                lift_target=target_carry_facing_cart.lift,
+            ),
+            Step(
+                "rotate to rack R",
+                qR_ngrip,
+                "open",
+                2.5,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
+            Step(
+                "ready to insert R",
+                qR_out,
+                "open",
+                1.5,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
+            Step(
+                "pin new server in rack R",
+                qR_out,
+                "open",
+                0.4,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
+            Step(
+                "slide into rack R",
+                HOME_ARM_Q.copy(),
+                "open",
+                2.0,
+                base_target=target_carry_back.base,
+                lift_target=target_carry_back.lift,
+            ),
+            Step(
+                "roll forward R",
+                HOME_ARM_Q.copy(),
+                "open",
+                1.0,
+                base_target=target_at_rack.base,
+                lift_target=target_at_rack.lift,
+            ),
+            Step(
+                "seat in rack R",
+                HOME_ARM_Q.copy(),
+                "open",
+                0.8,
+                base_target=target_at_rack.base,
+                lift_target=target_at_rack.lift,
+            ),
         ]
     )
 
@@ -1865,24 +2145,40 @@ def make_task_plan(
         q_a, _ = snap(approach)
         q_s, _ = snap(seated)
 
-        aux = {DataCenterAux.LIFT: LAYOUT.lift.cables}
+        cable_service_target = target_cables
         active_steps = [
-            Step(f"to c{port_idx + 1}", q_regrip, "open", 1.2, aux_ctrl=aux),
+            Step(
+                f"to c{port_idx + 1}",
+                q_regrip,
+                "open",
+                1.2,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
+            ),
             Step(
                 f"grip c{port_idx + 1}",
                 q_regrip,
                 "closed",
                 0.5,
-                aux_ctrl=aux,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
                 attach_activate=(cable_grasp_weld,),
             ),
-            Step(f"approach port {port_idx + 1}", q_a, "closed", 1.0, aux_ctrl=aux),
+            Step(
+                f"approach port {port_idx + 1}",
+                q_a,
+                "closed",
+                1.0,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
+            ),
             Step(
                 f"plug port {port_idx + 1}",
                 q_s,
                 "closed",
                 0.7,
-                aux_ctrl=aux,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
                 attach_activate=(port_weld_new,),
             ),
             Step(
@@ -1890,7 +2186,8 @@ def make_task_plan(
                 q_s,
                 "open",
                 0.4,
-                aux_ctrl=aux,
+                base_target=cable_service_target.base,
+                lift_target=cable_service_target.lift,
                 attach_deactivate=(cable_grasp_weld,),
             ),
         ]
@@ -1899,7 +2196,7 @@ def make_task_plan(
             _other_side(active_side),
             f"wait replug{port_idx + 1}",
             [s.duration for s in active_steps],
-            aux=aux,
+            target=cable_service_target,
         )
 
     plan_replug(0, ArmSide.LEFT)
@@ -1907,7 +2204,7 @@ def make_task_plan(
     plan_replug(2, ArmSide.LEFT)
 
     # 5) Return home
-    push_both("return home", 1.6, aux={DataCenterAux.LIFT: LAYOUT.lift.home})
+    push_both("return home", 1.6, target=target_home)
 
     for side in ARM_PREFIXES:
         print(f"  [{side}] {len(scripts[side])} steps planned")

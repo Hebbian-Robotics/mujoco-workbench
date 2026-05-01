@@ -32,7 +32,11 @@ from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes
 from mujoco_workbench.cameras import CameraRole, add_frustum_widgets, update_frustum_widgets
 from mujoco_workbench.phase_monitor import PhaseContractViolation, PhaseRuntimeMonitor
 from mujoco_workbench.rerun_stream import RerunStreamer
-from mujoco_workbench.runtime import load_scene
+from mujoco_workbench.runtime import (
+    load_scene,
+    resolve_timeline_actuator_maps,
+    validate_task_plan_targets,
+)
 from mujoco_workbench.scene_base import PhaseContract, Step, TaskPhase
 from mujoco_workbench.scene_check import (
     CameraInvariant,
@@ -55,6 +59,8 @@ class ArmTimelineState:
 
     start_q: np.ndarray
     start_g: float
+    start_base: dict[str, float] = field(default_factory=dict)
+    start_lift: float | None = None
     # Most-recently committed target per scene-owned aux actuator, so
     # interpolation continues smoothly across steps. Missing key ⇒ use current
     # data.ctrl at tick entry.
@@ -208,25 +214,22 @@ def main(argv: list[str] | None = None) -> None:
 
     cube_body_ids = _collect_cube_body_ids(model, scene.n_cubes)
     arms: dict[ArmSide, ArmHandles] = {
-        side: get_arm_handles(model, side, scene.n_cubes, scene.robot_kind)
-        for side in scene.arm_sides
+        manipulator.side: get_arm_handles(model, manipulator, scene.n_cubes)
+        for manipulator in scene.manipulators
     }
     arm_sides = scene.arm_sides
 
     # Scene-owned actuators (e.g. a lift prismatic). qpos/qvel addresses are
     # resolved alongside ids so puppet-mode can do direct writes.
-    aux_name_to_id: dict[str, int] = {
-        name: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        for name in scene.aux_actuator_names
-    }
-    for name, aid in aux_name_to_id.items():
+    timeline_actuators = resolve_timeline_actuator_maps(model, scene)
+    for name, aid in timeline_actuators.aux_name_to_id.items():
         if aid < 0:
             raise ValueError(
                 f"scene declared aux actuator {name!r} but no such actuator in compiled model"
             )
     aux_qposadr: dict[str, int] = {}
     aux_dofadr: dict[str, int] = {}
-    for name, aid in aux_name_to_id.items():
+    for name, aid in timeline_actuators.aux_name_to_id.items():
         # Aux actuators must be JOINT-transmission position actuators.
         jnt_id = int(model.actuator_trnid[aid][0])
         aux_qposadr[name] = int(model.jnt_qposadr[jnt_id])
@@ -281,6 +284,7 @@ def main(argv: list[str] | None = None) -> None:
 
         loaded = load_recording(args.play_recording)
         task_plan = {side: list(steps) for side, steps in loaded.items()}
+        validate_task_plan_targets(scene, arms, task_plan)
         scene.apply_initial_state(model, data, arms, cube_body_ids, start_phase=start_phase)
         print(f"Replaying recording: {args.play_recording}")
         for side in scene.arm_sides:
@@ -288,6 +292,7 @@ def main(argv: list[str] | None = None) -> None:
     elif scene.make_task_plan is not None:
         print("Solving IK waypoints...")
         task_plan = scene.make_task_plan(model, data, arms, cube_body_ids)
+        validate_task_plan_targets(scene, arms, task_plan)
         scene.apply_initial_state(model, data, arms, cube_body_ids, start_phase=start_phase)
 
     phase_contracts: tuple[PhaseContract, ...] = scene.phase_contracts
@@ -319,9 +324,8 @@ def main(argv: list[str] | None = None) -> None:
             wrist_id = arm.link6_id
             if wrist_id >= 0:
                 rerun_body_ids[f"{side.rstrip('/')}/wrist"] = wrist_id
-        suffixes = arm_joint_suffixes(scene.robot_kind)
-        for side in scene.arm_sides:
-            rerun_joint_names[side] = suffixes
+        for side, arm in arms.items():
+            rerun_joint_names[side] = arm_joint_suffixes(arm.robot_kind)
 
     rerun_tick_counter = {"n": 0}
 
@@ -382,7 +386,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"3-tuple (base_x, base_y, base_yaw); got {teleop_locked!r}"
             )
         a, b, c = teleop_locked
-        teleop_base_aux: tuple[str, str, str] = (str(a), str(b), str(c))
+        teleop_base_actuator_names: tuple[str, str, str] = (str(a), str(b), str(c))
         teleop_controller = TeleopController.attach(
             server,
             model=model,
@@ -393,7 +397,7 @@ def main(argv: list[str] | None = None) -> None:
             phase_contracts=phase_contracts,
             grippable_names=grippable_names,
             cube_body_ids=tuple(cube_body_ids),
-            base_aux_names=teleop_base_aux,
+            base_actuator_names=teleop_base_actuator_names,
             scene_name=args.scene,
         )
 
@@ -589,23 +593,53 @@ def main(argv: list[str] | None = None) -> None:
 
         tgt_g = arm.gripper_open if step.gripper == "open" else arm.gripper_closed
         curr_g = (1.0 - alpha_s) * st.start_g + alpha_s * tgt_g
-        if arm.robot_kind == "piper":
+        if (
+            arm.piper_mirrored_gripper_qpos_idx is not None
+            and arm.piper_mirrored_gripper_dof_idx is not None
+        ):
             # Piper joint7/8 are tendon-coupled finger slides. Puppet-write
             # both so the tendon equality has nothing to enforce.
-            data.qpos[arm.qpos_idx[6]] = curr_g
-            data.qpos[arm.qpos_idx[7]] = -curr_g
-            data.qvel[arm.dof_idx[6]] = 0.0
-            data.qvel[arm.dof_idx[7]] = 0.0
+            left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
+            left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
+            data.qpos[left_gripper_qpos_idx] = curr_g
+            data.qpos[right_gripper_qpos_idx] = -curr_g
+            data.qvel[left_gripper_dof_idx] = 0.0
+            data.qvel[right_gripper_dof_idx] = 0.0
         # UR10e + 2F-85: ctrl drives the tendon equality; the 4-bar linkage
         # joints settle on their own.
         data.ctrl[arm.act_gripper_id] = curr_g
 
         # Multiple arms may write the same aux on overlapping steps; last
         # write wins — scenes are expected to keep their targets consistent.
+        if step.base_target is not None:
+            for base_name, base_target in zip(
+                timeline_actuators.base_name_to_id,
+                step.base_target.as_tuple(),
+                strict=True,
+            ):
+                start = st.start_base.get(
+                    base_name,
+                    float(data.qpos[timeline_actuators.base_qposadr[base_name]]),
+                )
+                current_base_value = (1.0 - alpha_s) * start + alpha_s * base_target
+                data.qpos[timeline_actuators.base_qposadr[base_name]] = current_base_value
+                data.qvel[timeline_actuators.base_dofadr[base_name]] = 0.0
+                data.ctrl[timeline_actuators.base_name_to_id[base_name]] = current_base_value
+
+        if step.lift_target is not None:
+            for lift_name, actuator_id in timeline_actuators.lift_name_to_id.items():
+                start = st.start_lift
+                if start is None:
+                    start = float(data.qpos[timeline_actuators.lift_qposadr[lift_name]])
+                current_lift_value = (1.0 - alpha_s) * start + alpha_s * step.lift_target.position
+                data.qpos[timeline_actuators.lift_qposadr[lift_name]] = current_lift_value
+                data.qvel[timeline_actuators.lift_dofadr[lift_name]] = 0.0
+                data.ctrl[actuator_id] = current_lift_value
+
         if step.aux_ctrl:
             for aux_name, aux_target in step.aux_ctrl.items():
                 aux_key = str(aux_name)
-                aid = aux_name_to_id[aux_key]
+                aid = timeline_actuators.aux_name_to_id[aux_key]
                 start = st.start_aux.get(aux_key, float(data.qpos[aux_qposadr[aux_key]]))
                 curr_aux = (1.0 - alpha_s) * start + alpha_s * aux_target
                 data.qpos[aux_qposadr[aux_key]] = curr_aux
@@ -616,6 +650,15 @@ def main(argv: list[str] | None = None) -> None:
         if alpha >= 1.0:
             st.start_q = step.arm_q.copy()
             st.start_g = tgt_g
+            if step.base_target is not None:
+                for base_name, base_target in zip(
+                    timeline_actuators.base_name_to_id,
+                    step.base_target.as_tuple(),
+                    strict=True,
+                ):
+                    st.start_base[base_name] = base_target
+            if step.lift_target is not None:
+                st.start_lift = step.lift_target.position
             if step.aux_ctrl:
                 for aux_name, aux_target in step.aux_ctrl.items():
                     st.start_aux[str(aux_name)] = aux_target

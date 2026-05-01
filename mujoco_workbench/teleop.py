@@ -12,8 +12,8 @@ What teleop captures into each Step:
 
 * `arm_q` — solved joint config from the per-tick IK.
 * `gripper` — `open` | `closed` from the per-arm toggle.
-* `aux_ctrl` — base x/y/yaw from the base handle's pose, written so
-  replay drives the chassis through the existing aux-actuator path.
+* `base_target` — base x/y/yaw from the base handle's pose, written so
+  replay drives the chassis through the timeline's planar-base component path.
 * `attach_activate` / `attach_deactivate` — diffs against the desired
   weld state declared by per-weld checkboxes; weld toggles take
   effect immediately so the user sees the welded body update in
@@ -55,6 +55,7 @@ from mujoco_workbench.observability import check_phase_state
 from mujoco_workbench.scene_base import (
     CubeID,
     GripperState,
+    MobileBaseTarget,
     PhaseContract,
     Step,
     TaskPhase,
@@ -162,8 +163,8 @@ class _CapturedKeyframe:
     """One snapshot of an arm's state ready for serialisation.
 
     Keeps the same shape as `Step` so `load_recording` can build a
-    `Step` directly. `aux_ctrl` is shared between left and right arm
-    captures (both arms see the same base pose).
+    `Step` directly. `base_target` is shared between left and right arm
+    captures because both arms see the same base pose.
     """
 
     label: str
@@ -171,6 +172,7 @@ class _CapturedKeyframe:
     duration_s: float
     arm_q: np.ndarray
     gripper: GripperState
+    base_target: MobileBaseTarget | None = None
     aux_ctrl: dict[str, float] = field(default_factory=dict)
     attach_activate: tuple[str, ...] = ()
     attach_deactivate: tuple[str, ...] = ()
@@ -208,7 +210,7 @@ class TeleopController:
     # Parallel to `base_qposadr` — cached at attach time so `tick()`
     # can zero qvel without re-resolving joint ids every frame.
     base_dofadr: dict[str, int]
-    base_aux_names: tuple[str, str, str]  # (x, y, yaw)
+    base_actuator_names: tuple[str, str, str]  # (x, y, yaw)
     _scene_name: str = "unknown"
     _save_root: Path = field(default_factory=lambda: Path("/tmp/teleop_recordings"))
 
@@ -278,23 +280,22 @@ class TeleopController:
         phase_contracts: tuple[PhaseContract, ...],
         grippable_names: tuple[str, ...],
         cube_body_ids: tuple[int, ...],
-        base_aux_names: tuple[str, str, str],
+        base_actuator_names: tuple[str, str, str],
         scene_name: str,
         save_root: Path | None = None,
     ) -> TeleopController:
         """Build a controller and add its handles + GUI to `server`.
 
-        `base_aux_names` is the (x, y, yaw) tuple matching the scene's
-        `DataCenterAux` enum; the controller resolves their joint
-        indices from `model` and writes qpos directly to drive the
-        base from the dragged handle.
+        `base_actuator_names` is the scene's (x, y, yaw) actuator tuple. The
+        controller resolves their joint indices from `model` and writes qpos
+        directly to drive the base from the dragged handle.
         """
         # Resolve base joint qpos + dof addresses (so we can puppet the
         # chassis from the handle and zero qvel without re-looking-up
         # joint ids every tick).
         base_qposadr: dict[str, int] = {}
         base_dofadr: dict[str, int] = {}
-        for joint_name in base_aux_names:
+        for joint_name in base_actuator_names:
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
             if jid < 0:
                 # Maybe the name is an actuator — resolve via its trnid.
@@ -319,7 +320,7 @@ class TeleopController:
             cube_body_ids=cube_body_ids,
             base_qposadr=base_qposadr,
             base_dofadr=base_dofadr,
-            base_aux_names=base_aux_names,
+            base_actuator_names=base_actuator_names,
             _scene_name=scene_name,
             _save_root=save_root or Path("/tmp/teleop_recordings"),
         )
@@ -369,9 +370,9 @@ class TeleopController:
     def _read_base_pose(self) -> tuple[float, float, float]:
         """Current (base_x, base_y, base_yaw) read from data.qpos."""
         return (
-            float(self.data.qpos[self.base_qposadr[self.base_aux_names[0]]]),
-            float(self.data.qpos[self.base_qposadr[self.base_aux_names[1]]]),
-            float(self.data.qpos[self.base_qposadr[self.base_aux_names[2]]]),
+            float(self.data.qpos[self.base_qposadr[self.base_actuator_names[0]]]),
+            float(self.data.qpos[self.base_qposadr[self.base_actuator_names[1]]]),
+            float(self.data.qpos[self.base_qposadr[self.base_actuator_names[2]]]),
         )
 
     @staticmethod
@@ -483,11 +484,10 @@ class TeleopController:
             # IK / runtime code uses to resolve joint IDs, so a robot
             # swap can't drift labels out of sync with the actual
             # joints they're driving.
-            arm_joint_labels = arm_joint_suffixes(next(iter(self.arms.values())).robot_kind)
-
             for side in self.arms:
                 arm_label = side.rstrip("/") or "arm"
                 arm = self.arms[side]
+                arm_joint_labels = arm_joint_suffixes(arm.robot_kind)
                 seed = marker_seeds[side]
                 with self.server.gui.add_folder(f"{arm_label} arm"):
                     # --- TCP body-frame target sliders ----------------
@@ -626,9 +626,11 @@ class TeleopController:
             # rationale as arm sliders: viser TransformControls don't
             # round-trip drag updates in this version.
             with self.server.gui.add_folder("Base"):
-                base_init_x = float(self.data.qpos[self.base_qposadr[self.base_aux_names[0]]])
-                base_init_y = float(self.data.qpos[self.base_qposadr[self.base_aux_names[1]]])
-                base_init_yaw = float(self.data.qpos[self.base_qposadr[self.base_aux_names[2]]])
+                base_init_x = float(self.data.qpos[self.base_qposadr[self.base_actuator_names[0]]])
+                base_init_y = float(self.data.qpos[self.base_qposadr[self.base_actuator_names[1]]])
+                base_init_yaw = float(
+                    self.data.qpos[self.base_qposadr[self.base_actuator_names[2]]]
+                )
                 # Auto-fit slider range so any `--start-phase` seed lands inside
                 # the slider bounds. ±3 m of slack past the initial means the
                 # user can drive the chassis around freely from wherever they
@@ -766,7 +768,7 @@ class TeleopController:
         #    previous frame's qpos jump.
         base_sliders = self._base_sliders_or_none()
         if base_sliders is not None:
-            for slider, name in zip(base_sliders, self.base_aux_names, strict=True):
+            for slider, name in zip(base_sliders, self.base_actuator_names, strict=True):
                 self.data.qpos[self.base_qposadr[name]] = float(slider.value)
                 self.data.qvel[self.base_dofadr[name]] = 0.0
 
@@ -793,11 +795,16 @@ class TeleopController:
 
             target_g = arm.gripper_open if state.gripper == "open" else arm.gripper_closed
             self.data.ctrl[arm.act_gripper_id] = target_g
-            if arm.robot_kind == "piper":
-                self.data.qpos[arm.qpos_idx[6]] = target_g
-                self.data.qpos[arm.qpos_idx[7]] = -target_g
-                self.data.qvel[arm.dof_idx[6]] = 0.0
-                self.data.qvel[arm.dof_idx[7]] = 0.0
+            if (
+                arm.piper_mirrored_gripper_qpos_idx is not None
+                and arm.piper_mirrored_gripper_dof_idx is not None
+            ):
+                left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
+                left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
+                self.data.qpos[left_gripper_qpos_idx] = target_g
+                self.data.qpos[right_gripper_qpos_idx] = -target_g
+                self.data.qvel[left_gripper_dof_idx] = 0.0
+                self.data.qvel[right_gripper_dof_idx] = 0.0
 
         if self._ik_pos_err_text is not None:
             self._ik_pos_err_text.value = (
@@ -903,10 +910,12 @@ class TeleopController:
             if not want and self._weld_at_last_capture.get(name, False)
         )
 
-        # Snapshot base aux for replay.
-        aux_ctrl = {
-            name: float(self.data.qpos[self.base_qposadr[name]]) for name in self.base_aux_names
-        }
+        # Snapshot planar base as a first-class replay target.
+        base_target = MobileBaseTarget(
+            x=float(self.data.qpos[self.base_qposadr[self.base_actuator_names[0]]]),
+            y=float(self.data.qpos[self.base_qposadr[self.base_actuator_names[1]]]),
+            yaw=float(self.data.qpos[self.base_qposadr[self.base_actuator_names[2]]]),
+        )
 
         for side, state in self._arm_states.items():
             arm = self.arms[side]
@@ -940,7 +949,7 @@ class TeleopController:
                     duration_s=duration,
                     arm_q=qpos_now,
                     gripper=state.gripper,
-                    aux_ctrl=dict(aux_ctrl),
+                    base_target=base_target,
                     attach_activate=attach_activate,
                     attach_deactivate=attach_deactivate,
                     weld_activate_idx=weld_activate_idx,
@@ -1028,7 +1037,7 @@ class TeleopController:
         # Refresh the base sliders too — chassis qpos was just rewritten.
         base_sliders = self._base_sliders_or_none()
         if base_sliders is not None:
-            for slider, jname in zip(base_sliders, self.base_aux_names, strict=True):
+            for slider, jname in zip(base_sliders, self.base_actuator_names, strict=True):
                 self._set_slider(slider, float(self.data.qpos[self.base_qposadr[jname]]))
         mujoco.mj_forward(self.model, self.data)
 
@@ -1288,6 +1297,15 @@ class TeleopController:
                         "duration_s": kf.duration_s,
                         "arm_q": kf.arm_q.tolist(),
                         "gripper": kf.gripper,
+                        "base_target": (
+                            {
+                                "x": kf.base_target.x,
+                                "y": kf.base_target.y,
+                                "yaw": kf.base_target.yaw,
+                            }
+                            if kf.base_target is not None
+                            else None
+                        ),
                         "aux_ctrl": kf.aux_ctrl,
                         "attach_activate": list(kf.attach_activate),
                         "attach_deactivate": list(kf.attach_deactivate),
@@ -1313,7 +1331,7 @@ class TeleopController:
 def load_recording(path: Path) -> Mapping[ArmSide, list[Step]]:
     """Read a teleop JSON recording and return a per-arm `Step` list.
 
-    Reconstructs every captured field — `aux_ctrl` for base motion,
+    Reconstructs every captured field — `base_target` for base motion,
     `attach_activate` / `attach_deactivate` for weld toggles, and
     `weld_activate` / `weld_deactivate` for per-arm grasps. The
     runner replays these via the same code paths the scripted scene
@@ -1352,6 +1370,15 @@ def load_recording(path: Path) -> Mapping[ArmSide, list[Step]]:
                 gripper=_parse_gripper_state(kf["gripper"]),
                 duration=float(kf["duration_s"]),
                 phase=TaskPhase(kf["phase"]),
+                base_target=(
+                    MobileBaseTarget(
+                        x=float(kf["base_target"]["x"]),
+                        y=float(kf["base_target"]["y"]),
+                        yaw=float(kf["base_target"]["yaw"]),
+                    )
+                    if kf.get("base_target") is not None
+                    else None
+                ),
                 aux_ctrl=dict(kf.get("aux_ctrl") or {}) or None,
                 attach_activate=tuple(kf.get("attach_activate") or ()),
                 attach_deactivate=tuple(kf.get("attach_deactivate") or ()),
