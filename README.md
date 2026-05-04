@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/af5a213e-7783-4ee4-82b9-29833cae0406
 
-Prototype robot behaviors in MuJoCo with coding agents like Codex and Claude Code, so your team can collaborate visually on the trajectory before anyone writes a training loop.
+Prototype custom scenes in MuJoCo with coding agents like Codex and Claude Code, for generating training data needed for diversity, or for quick, directionally correct evaluation checks.
 
 **How it works:** install the bundled Agent skills, describe what you want, and the agent scaffolds a working sim for you. No MuJoCo experience required to get started. The skills teach the agent the `mwb` CLI, the scene layout conventions, and the debug tools so it can iterate on behavior without you needing to know the plumbing.
 
