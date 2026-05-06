@@ -59,13 +59,15 @@ class PhaseRuntimeMonitor:
         contracts: tuple[PhaseContract, ...],
         *,
         strict: bool = False,
+        evaluation_mode: bool = False,
         invariant_sample_every: int = DEFAULT_INVARIANT_SAMPLE_EVERY,
         on_failure: Callable[[ContractFailure], None] | None = None,
     ) -> None:
         self._contracts_by_phase: dict[TaskPhase, PhaseContract] = {
             contract.phase: contract for contract in contracts
         }
-        self._strict = strict
+        self._evaluation_mode = evaluation_mode
+        self._strict = strict and not evaluation_mode
         self._sample_every = max(1, invariant_sample_every)
         self._on_failure = on_failure
         self._current_phase: TaskPhase | None = None
@@ -81,6 +83,10 @@ class PhaseRuntimeMonitor:
     @property
     def strict(self) -> bool:
         return self._strict
+
+    @property
+    def evaluation_mode(self) -> bool:
+        return self._evaluation_mode
 
     @property
     def current_phase(self) -> TaskPhase | None:

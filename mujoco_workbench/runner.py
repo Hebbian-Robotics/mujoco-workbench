@@ -17,9 +17,12 @@ drops the realtime throttle so the sim runs as fast as MuJoCo can step.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
+import signal
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,9 +33,18 @@ import viser
 
 from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes, get_arm_handles
 from mujoco_workbench.cameras import CameraRole, add_frustum_widgets, update_frustum_widgets
+from mujoco_workbench.headless_renderer import NamedCameraRenderer
 from mujoco_workbench.phase_monitor import PhaseContractViolation, PhaseRuntimeMonitor
+from mujoco_workbench.policy_types import (
+    PolicyEndpoint,
+    PolicyPrompt,
+    make_policy_endpoint,
+    make_policy_prompt,
+)
 from mujoco_workbench.rerun_stream import RerunStreamer
 from mujoco_workbench.runtime import (
+    LoadedScene,
+    StepFreePlay,
     load_scene,
     resolve_timeline_actuator_maps,
     validate_task_plan_targets,
@@ -69,8 +81,91 @@ class ArmTimelineState:
     t: float = 0.0
 
 
-def _collect_cube_body_ids(model: mujoco.MjModel, n_cubes: int) -> list[int]:
-    return [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"cube{i}") for i in range(n_cubes)]
+def _collect_grippable_body_ids(
+    model: mujoco.MjModel,
+    grippable_names: tuple[str, ...],
+) -> list[int]:
+    return [
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, grippable_name)
+        for grippable_name in grippable_names
+    ]
+
+
+@contextlib.contextmanager
+def shutdown_signal_as_keyboard_interrupt() -> Iterator[None]:
+    """Let normal runner cleanup run when the process receives SIGTERM."""
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, original_sigterm_handler)
+
+
+def build_policy_step_free_play(
+    scene: LoadedScene,
+    *,
+    scene_module_name: str,
+    policy_endpoint: PolicyEndpoint,
+    policy_prompt: PolicyPrompt,
+) -> StepFreePlay:
+    """Instantiate a scene's hosted-policy free-play controller."""
+    if scene.make_step_free_play is None:
+        raise ValueError(
+            f"--policy-host was set, but scene {scene_module_name!r} does not expose "
+            "make_step_free_play(policy_endpoint=..., prompt=...)"
+        )
+    return scene.make_step_free_play(
+        policy_endpoint=policy_endpoint,
+        prompt=policy_prompt,
+    )
+
+
+def prewarm_step_free_play(
+    step_free_play: StepFreePlay | None,
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+) -> bool:
+    """Run a free-play prewarm hook when the controller exposes one."""
+    free_play_prewarm = getattr(step_free_play, "prewarm", None)
+    if not callable(free_play_prewarm):
+        return False
+    free_play_prewarm(model, data)
+    return True
+
+
+def reset_step_free_play(step_free_play: StepFreePlay | None) -> bool:
+    """Run a free-play reset hook when the controller exposes one."""
+    free_play_reset = getattr(step_free_play, "reset", None)
+    if not callable(free_play_reset):
+        return False
+    free_play_reset()
+    return True
+
+
+def close_step_free_play(step_free_play: StepFreePlay | None) -> bool:
+    """Run a free-play close hook when the controller exposes one."""
+    free_play_close = getattr(step_free_play, "close", None)
+    if not callable(free_play_close):
+        return False
+    free_play_close()
+    return True
+
+
+def set_step_free_play_prompt(
+    step_free_play: StepFreePlay | None,
+    policy_prompt: PolicyPrompt,
+) -> bool:
+    """Update a policy free-play prompt when the controller exposes a setter."""
+    free_play_set_prompt = getattr(step_free_play, "set_prompt", None)
+    if not callable(free_play_set_prompt):
+        return False
+    free_play_set_prompt(policy_prompt)
+    return True
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -188,9 +283,64 @@ def main(argv: list[str] | None = None) -> None:
             "author further from there or replay onward."
         ),
     )
+    parser.add_argument(
+        "--policy-host",
+        type=str,
+        default=None,
+        help=(
+            "connect to a hosted OpenPI policy server and use the scene's "
+            "make_step_free_play factory instead of a scripted task plan"
+        ),
+    )
+    parser.add_argument(
+        "--policy-port",
+        type=int,
+        default=5555,
+        help="hosted OpenPI policy server QUIC port",
+    )
+    parser.add_argument(
+        "--policy-local-port",
+        type=int,
+        default=5556,
+        help="local UDP port used by the OpenPI flash transport client sidecar",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="do something",
+        help="language instruction sent to the hosted policy",
+    )
+    parser.add_argument(
+        "--policy-eval",
+        action="store_true",
+        help=(
+            "evaluate phase contracts without raising; intended for policy "
+            "rollouts where failures should be logged and scored"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.teleop and args.play_recording is not None:
         parser.error("--teleop and --play-recording are mutually exclusive")
+    if args.policy_host is not None and args.teleop:
+        parser.error("--policy-host and --teleop are mutually exclusive")
+    if args.policy_host is not None and args.play_recording is not None:
+        parser.error("--policy-host and --play-recording are mutually exclusive")
+    if args.policy_eval and args.strict:
+        parser.error("--policy-eval and --strict are mutually exclusive")
+    if args.policy_eval and args.policy_host is None:
+        parser.error("--policy-eval requires --policy-host")
+    policy_endpoint: PolicyEndpoint | None = None
+    policy_prompt: PolicyPrompt | None = None
+    if args.policy_host is not None:
+        try:
+            policy_endpoint = make_policy_endpoint(
+                host=args.policy_host,
+                port=args.policy_port,
+                local_port=args.policy_local_port,
+            )
+            policy_prompt = make_policy_prompt(args.prompt)
+        except ValueError as err:
+            parser.error(str(err))
     start_phase: TaskPhase | None = None
     if args.start_phase is not None:
         # Case-insensitive — accept 'REMOVE_OLD_SERVER' or 'remove_old_server'.
@@ -201,6 +351,7 @@ def main(argv: list[str] | None = None) -> None:
             parser.error(f"--start-phase {args.start_phase!r} not in TaskPhase. Valid: {valid}")
     if args.rerun_port is not None and args.rerun_connect is not None:
         parser.error("--rerun-port and --rerun-connect are mutually exclusive")
+    policy_mode = policy_endpoint is not None
 
     print(f"Loading {args.scene} ...")
     scene = load_scene(args.scene)
@@ -212,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
         f"neq={model.neq} ngeom={model.ngeom}"
     )
 
-    cube_body_ids = _collect_cube_body_ids(model, scene.n_cubes)
+    cube_body_ids = _collect_grippable_body_ids(model, scene.grippable_names)
     arms: dict[ArmSide, ArmHandles] = {
         manipulator.side: get_arm_handles(model, manipulator, scene.n_cubes)
         for manipulator in scene.manipulators
@@ -276,6 +427,25 @@ def main(argv: list[str] | None = None) -> None:
         camera_invariants=camera_invariants,
     )
 
+    active_step_free_play = scene.step_free_play
+    if policy_mode:
+        assert policy_endpoint is not None
+        assert policy_prompt is not None
+        try:
+            active_step_free_play = build_policy_step_free_play(
+                scene,
+                scene_module_name=args.scene,
+                policy_endpoint=policy_endpoint,
+                policy_prompt=policy_prompt,
+            )
+        except ValueError as err:
+            raise SystemExit(str(err)) from err
+        print(
+            f"Policy mode: hosted OpenPI server {policy_endpoint.host}:{policy_endpoint.port}; "
+            f"local_port={policy_endpoint.local_port}; "
+            f"prompt={policy_prompt!r}"
+        )
+
     task_plan: dict[ArmSide, list[Step]] | None = None
     if args.teleop:
         print("Teleop mode: dragging TCP handles drives live IK.")
@@ -289,17 +459,22 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Replaying recording: {args.play_recording}")
         for side in scene.arm_sides:
             print(f"  [{side}] {len(task_plan[side])} steps loaded")
-    elif scene.make_task_plan is not None:
+    elif not policy_mode and scene.make_task_plan is not None:
         print("Solving IK waypoints...")
         task_plan = scene.make_task_plan(model, data, arms, cube_body_ids)
         validate_task_plan_targets(scene, arms, task_plan)
         scene.apply_initial_state(model, data, arms, cube_body_ids, start_phase=start_phase)
 
     phase_contracts: tuple[PhaseContract, ...] = scene.phase_contracts
-    phase_monitor = PhaseRuntimeMonitor(phase_contracts, strict=args.strict)
+    phase_monitor = PhaseRuntimeMonitor(
+        phase_contracts,
+        strict=args.strict,
+        evaluation_mode=args.policy_eval,
+    )
     if phase_monitor.enabled:
         print(
-            f"PhaseRuntimeMonitor active ({len(phase_contracts)} contracts, strict={args.strict})"
+            f"PhaseRuntimeMonitor active ({len(phase_contracts)} contracts, "
+            f"strict={phase_monitor.strict}, evaluation={phase_monitor.evaluation_mode})"
         )
 
     # One source feeds at most one rerun sink (gRPC serve, gRPC connect, .rrd).
@@ -328,8 +503,9 @@ def main(argv: list[str] | None = None) -> None:
             rerun_joint_names[side] = arm_joint_suffixes(arm.robot_kind)
 
     rerun_tick_counter = {"n": 0}
+    camera_feed_tick_counter = {"n": 0}
 
-    has_free_play = scene.step_free_play is not None
+    has_free_play = active_step_free_play is not None
     if task_plan is None and not has_free_play and not args.teleop:
         print(
             "warning: scene provides neither make_task_plan nor step_free_play; "
@@ -401,11 +577,45 @@ def main(argv: list[str] | None = None) -> None:
             scene_name=args.scene,
         )
 
-    control = {"playing": True, "reset_requested": False}
+    control = {"playing": not policy_mode, "reset_requested": False}
+
+    if policy_mode:
+        assert policy_endpoint is not None
+        assert policy_prompt is not None
+        with server.gui.add_folder("Policy"):
+            server.gui.add_text(
+                "endpoint",
+                initial_value=f"{policy_endpoint.host}:{policy_endpoint.port}",
+                disabled=True,
+            )
+            gui_policy_prompt = server.gui.add_text(
+                "prompt",
+                initial_value=str(policy_prompt),
+                hint="language instruction sent with each hosted policy observation",
+            )
+            gui_policy_status = server.gui.add_text(
+                "policy",
+                initial_value="set prompt, apply, then play",
+                disabled=True,
+            )
+            gui_apply_policy_prompt = server.gui.add_button("apply prompt")
+
+        @gui_apply_policy_prompt.on_click
+        def _on_apply_policy_prompt(_event: Any) -> None:
+            nonlocal policy_prompt
+            try:
+                updated_policy_prompt = make_policy_prompt(str(gui_policy_prompt.value))
+            except ValueError as err:
+                gui_policy_status.value = str(err)
+                return
+            policy_prompt = updated_policy_prompt
+            set_step_free_play_prompt(active_step_free_play, updated_policy_prompt)
+            gui_policy_status.value = f"applied: {updated_policy_prompt}; press play"
 
     @gui_play.on_click
     def _on_play(_event: Any) -> None:
         control["playing"] = not control["playing"]
+        gui_state.value = "running" if control["playing"] else "paused"
 
     @gui_reset.on_click
     def _on_reset(_event: Any) -> None:
@@ -447,6 +657,30 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
 
+    camera_feed_renderer: NamedCameraRenderer | None = None
+    camera_feed_handles: dict[str, viser.GuiImageHandle] = {}
+    camera_feed_every = 3
+    if cameras:
+        camera_feed_renderer = NamedCameraRenderer(
+            model,
+            width=scene.camera_feed.render_width,
+            height=scene.camera_feed.render_height,
+        )
+        initial_camera_feed_image = np.zeros((224, 224, 3), dtype=np.uint8)
+        if scene.camera_feed.preprocess is None:
+            initial_camera_feed_image = np.zeros(
+                (scene.camera_feed.render_height, scene.camera_feed.render_width, 3),
+                dtype=np.uint8,
+            )
+        with server.gui.add_folder("Camera feeds"):
+            for camera_name, _camera_role in cameras:
+                camera_feed_handles[camera_name] = server.gui.add_image(
+                    initial_camera_feed_image,
+                    label=camera_name,
+                    format="jpeg",
+                    jpeg_quality=75,
+                )
+
     sim_dt = float(model.opt.timestep)
     # Decouple render rate from physics timestep: each frame we step physics
     # `phys_steps_per_frame` times so wall-clock advance = render_dt.
@@ -477,6 +711,7 @@ def main(argv: list[str] | None = None) -> None:
         scene.apply_initial_state(model, data, arms, cube_body_ids, start_phase=start_phase)
         per_arm = fresh_state()
         phase_monitor.reset()
+        reset_step_free_play(active_step_free_play)
         # Restore any geom RGBAs that were mutated by `set_geom_rgba` during
         # the run. Iterate over a copy because `update_geom_rgba` may end up
         # mutating the registry; clear the dirty set after.
@@ -699,6 +934,13 @@ def main(argv: list[str] | None = None) -> None:
         f"If remote: `ssh -L {args.port}:localhost:{args.port} user@host` "
         f"then open http://localhost:{args.port}"
     )
+    free_play_can_prewarm = callable(getattr(active_step_free_play, "prewarm", None))
+    if free_play_can_prewarm and not policy_mode:
+        print("Pre-warming hosted policy with the initial observation...")
+        prewarm_step_free_play(active_step_free_play, model, data)
+        print("Policy pre-warm complete")
+    if free_play_can_prewarm and policy_mode:
+        print("Policy mode starts paused. Set/apply the prompt in the Viser UI, then press play.")
     if task_plan is not None:
         parts = ", ".join(f"{side}={len(task_plan[side])}" for side in arm_sides)
         print(f"Timeline: {parts} steps (run in parallel)")
@@ -709,81 +951,106 @@ def main(argv: list[str] | None = None) -> None:
     plan_finished_announced = False
 
     try:
-        while True:
-            if control["reset_requested"]:
-                restart()
-                sim_t = 0.0
-                plan_finished_announced = False
-                control["reset_requested"] = False
+        with shutdown_signal_as_keyboard_interrupt():
+            while True:
+                if control["reset_requested"]:
+                    restart()
+                    sim_t = 0.0
+                    plan_finished_announced = False
+                    control["reset_requested"] = False
 
-            # Teleop tick is unconditional: dragging a handle must move the
-            # arm even when the sim is paused, since teleop is for authoring.
-            if teleop_controller is not None:
-                teleop_controller.tick(render_dt)
-                gui_state.value = "teleop"
-            elif control["playing"]:
-                if task_plan is not None:
-                    phase_monitor.on_phase_observed(observed_scene_phase(), model, data)
-                    for side in arm_sides:
-                        per_arm_gui[side].value = advance_arm(side, render_dt)
-                    if all_done():
-                        if not plan_finished_announced:
-                            phase_monitor.on_plan_finished(model, data)
-                            plan_finished_announced = True
-                        gui_state.value = "done — press reset"
-                        control["playing"] = False
+                # Teleop tick is unconditional: dragging a handle must move the
+                # arm even when the sim is paused, since teleop is for authoring.
+                if teleop_controller is not None:
+                    teleop_controller.tick(render_dt)
+                    gui_state.value = "teleop"
+                elif control["playing"]:
+                    if task_plan is not None:
+                        phase_monitor.on_phase_observed(observed_scene_phase(), model, data)
+                        for side in arm_sides:
+                            per_arm_gui[side].value = advance_arm(side, render_dt)
+                        if all_done():
+                            if not plan_finished_announced:
+                                phase_monitor.on_plan_finished(model, data)
+                                plan_finished_announced = True
+                            gui_state.value = "done — press reset"
+                            control["playing"] = False
+                        else:
+                            gui_state.value = "running"
+                    elif active_step_free_play is not None:
+                        gui_state.value = "policy infer..."
+                        try:
+                            active_step_free_play(sim_t, model, data)
+                        except Exception as err:
+                            control["playing"] = False
+                            gui_state.value = f"policy error: {type(err).__name__}"
+                            print(f"\n[policy] {type(err).__name__}: {err}", flush=True)
+                        else:
+                            gui_state.value = "running"
                     else:
-                        gui_state.value = "running"
-                elif scene.step_free_play is not None:
-                    scene.step_free_play(sim_t, model, data)
-                    gui_state.value = "running"
+                        gui_state.value = "idle"
                 else:
-                    gui_state.value = "idle"
-            else:
-                gui_state.value = "paused" if not all_done() else "done — press reset"
+                    gui_state.value = "paused" if not all_done() else "done — press reset"
 
-            for _ in range(phys_steps_per_frame):
-                mujoco.mj_step(model, data)
-                phase_monitor.on_tick(model, data)
-            sim_t += render_dt
+                for _ in range(phys_steps_per_frame):
+                    mujoco.mj_step(model, data)
+                    phase_monitor.on_tick(model, data)
+                sim_t += render_dt
 
-            update_viser(server, model, data, handles)
-            if frustum_handles:
-                update_frustum_widgets(server, data, frustum_handles)
+                update_viser(server, model, data, handles)
+                if frustum_handles:
+                    update_frustum_widgets(server, data, frustum_handles)
+                if (
+                    camera_feed_renderer is not None
+                    and camera_feed_handles
+                    and camera_feed_tick_counter["n"] % camera_feed_every == 0
+                ):
+                    for camera_name, image_handle in camera_feed_handles.items():
+                        rendered_camera_feed_image = camera_feed_renderer.render(data, camera_name)
+                        if scene.camera_feed.preprocess is not None:
+                            rendered_camera_feed_image = scene.camera_feed.preprocess(
+                                camera_name,
+                                rendered_camera_feed_image,
+                            )
+                        image_handle.image = rendered_camera_feed_image
+                camera_feed_tick_counter["n"] += 1
 
-            # Log once per render tick: rerun is for user-visible debugging,
-            # so per-physics-tick is wasteful.
-            if rerun_streamer is not None:
-                rerun_streamer.set_sim_time(sim_t)
-                for side in arm_sides:
-                    arm = arms[side]
-                    qpos = np.asarray([data.qpos[i] for i in arm.arm_qpos_idx], dtype=float)
-                    rerun_streamer.log_joint_scalars(
-                        side_prefix=str(side),
-                        joint_names=rerun_joint_names[side],
-                        qpos=qpos,
-                    )
-                for body_name, body_id in rerun_body_ids.items():
-                    rerun_streamer.log_body_transform(
-                        name=body_name,
-                        xpos=np.asarray(data.xpos[body_id], dtype=float),
-                        xquat=np.asarray(data.xquat[body_id], dtype=float),
-                    )
-                rerun_tick_counter["n"] += 1
+                # Log once per render tick: rerun is for user-visible debugging,
+                # so per-physics-tick is wasteful.
+                if rerun_streamer is not None:
+                    rerun_streamer.set_sim_time(sim_t)
+                    for side in arm_sides:
+                        arm = arms[side]
+                        qpos = np.asarray([data.qpos[i] for i in arm.arm_qpos_idx], dtype=float)
+                        rerun_streamer.log_joint_scalars(
+                            side_prefix=str(side),
+                            joint_names=rerun_joint_names[side],
+                            qpos=qpos,
+                        )
+                    for body_name, body_id in rerun_body_ids.items():
+                        rerun_streamer.log_body_transform(
+                            name=body_name,
+                            xpos=np.asarray(data.xpos[body_id], dtype=float),
+                            xquat=np.asarray(data.xquat[body_id], dtype=float),
+                        )
+                    rerun_tick_counter["n"] += 1
 
-            if not args.max_rate:
-                next_tick += render_dt
-                sleep = next_tick - time.perf_counter()
-                if sleep > 0:
-                    time.sleep(sleep)
-                else:
-                    next_tick = time.perf_counter()
+                if not args.max_rate:
+                    next_tick += render_dt
+                    sleep = next_tick - time.perf_counter()
+                    if sleep > 0:
+                        time.sleep(sleep)
+                    else:
+                        next_tick = time.perf_counter()
     except KeyboardInterrupt:
         print("stopped")
     except PhaseContractViolation as exc:
         print(f"\n[strict] phase contract violation:\n  {exc}")
         sys.exit(2)
     finally:
+        close_step_free_play(active_step_free_play)
+        if camera_feed_renderer is not None:
+            camera_feed_renderer.close()
         if phase_monitor.enabled and phase_monitor.failures:
             print(f"\nPhaseRuntimeMonitor: {len(phase_monitor.failures)} contract failure(s):")
             for failure in phase_monitor.failures:

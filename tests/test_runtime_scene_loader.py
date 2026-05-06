@@ -83,6 +83,43 @@ def test_load_scene_accepts_per_manipulator_robot_kinds() -> None:
     assert loaded_scene.aux_actuator_names == ("server_latch",)
 
 
+def test_load_scene_parses_policy_free_play_factory() -> None:
+    module_name = "tests._fake_policy_factory_scene"
+
+    def make_step_free_play(**_kwargs: object) -> object:
+        return object()
+
+    _install_scene_module(
+        module_name,
+        MANIPULATORS=({"side": "left/", "robot_kind": "franka_panda"},),
+        make_step_free_play=make_step_free_play,
+    )
+
+    loaded_scene = load_scene(module_name)
+
+    assert loaded_scene.make_step_free_play is make_step_free_play
+
+
+def test_load_scene_parses_camera_feed_preprocessing() -> None:
+    module_name = "tests._fake_camera_feed_scene"
+
+    def preprocess_camera_feed(_camera_name: str, image: object) -> object:
+        return image
+
+    _install_scene_module(
+        module_name,
+        CAMERA_FEED_RENDER_WIDTH=320,
+        CAMERA_FEED_RENDER_HEIGHT=180,
+        preprocess_camera_feed=preprocess_camera_feed,
+    )
+
+    loaded_scene = load_scene(module_name)
+
+    assert loaded_scene.camera_feed.render_width == 320
+    assert loaded_scene.camera_feed.render_height == 180
+    assert loaded_scene.camera_feed.preprocess is preprocess_camera_feed
+
+
 def test_load_scene_does_not_infer_base_from_aux_actuators() -> None:
     module_name = "tests._fake_aux_only_scene"
     _install_scene_module(

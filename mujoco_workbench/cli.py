@@ -61,6 +61,26 @@ def run(
         int,
         typer.Option(help="Include named-camera frames every N render ticks; 0 disables."),
     ] = 0,
+    policy_host: Annotated[
+        str | None,
+        typer.Option(help="Hosted OpenPI policy server host. Enables policy free-play mode."),
+    ] = None,
+    policy_port: Annotated[
+        int,
+        typer.Option(help="Hosted OpenPI policy server QUIC port."),
+    ] = 5555,
+    policy_local_port: Annotated[
+        int,
+        typer.Option(help="Local UDP port used by the OpenPI flash transport sidecar."),
+    ] = 5556,
+    prompt: Annotated[
+        str,
+        typer.Option(help="Language instruction sent to the hosted policy."),
+    ] = "do something",
+    policy_eval: Annotated[
+        bool,
+        typer.Option(help="Run phase contracts in non-raising policy evaluation mode."),
+    ] = False,
 ) -> None:
     """Run an interactive Viser scene."""
     from mujoco_workbench import runner
@@ -97,6 +117,16 @@ def run(
         argv.extend(["--rerun-connect", rerun_connect])
     if rerun_rrd is not None:
         argv.extend(["--rerun-rrd", str(rerun_rrd)])
+    if policy_host is not None:
+        argv.extend(["--policy-host", policy_host])
+    if policy_port != 5555:
+        argv.extend(["--policy-port", str(policy_port)])
+    if policy_local_port != 5556:
+        argv.extend(["--policy-local-port", str(policy_local_port)])
+    if prompt != "do something":
+        argv.extend(["--prompt", prompt])
+    if policy_eval:
+        argv.append("--policy-eval")
     runner.main(argv)
 
 
@@ -131,6 +161,90 @@ def video_export(
         crf=crf,
         preset=preset,
     )
+
+
+@app.command("policy-smoke")
+def policy_smoke(
+    scene: Annotated[
+        str,
+        typer.Argument(help="Fully qualified policy-capable scene module."),
+    ],
+    policy_host: Annotated[
+        str,
+        typer.Option(help="Hosted OpenPI policy server host."),
+    ],
+    policy_port: Annotated[
+        int,
+        typer.Option(help="Hosted OpenPI policy server QUIC port."),
+    ] = 5555,
+    policy_local_port: Annotated[
+        int,
+        typer.Option(help="Local UDP port used by the OpenPI flash transport sidecar."),
+    ] = 5556,
+    prompt: Annotated[
+        str,
+        typer.Option(help="Language instruction sent to the hosted policy."),
+    ] = "do something",
+) -> None:
+    """Headless one-step hosted-policy smoke test."""
+    import mujoco
+    import numpy as np
+
+    from mujoco_workbench.arm_handles import get_arm_handles
+    from mujoco_workbench.policy_types import make_policy_endpoint, make_policy_prompt
+    from mujoco_workbench.runner import (
+        build_policy_step_free_play,
+        close_step_free_play,
+        prewarm_step_free_play,
+        shutdown_signal_as_keyboard_interrupt,
+    )
+    from mujoco_workbench.runtime import load_scene
+
+    loaded_scene = load_scene(scene)
+    print(f"Loading {scene} ...")
+    model, data = loaded_scene.build_spec()
+    print(
+        f"compiled: nbody={model.nbody} njnt={model.njnt} nu={model.nu} "
+        f"neq={model.neq} ngeom={model.ngeom}"
+    )
+    cube_body_ids = [
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, grippable_name))
+        for grippable_name in loaded_scene.grippable_names
+    ]
+    arms = {
+        manipulator.side: get_arm_handles(model, manipulator, loaded_scene.n_cubes)
+        for manipulator in loaded_scene.manipulators
+    }
+    loaded_scene.apply_initial_state(model, data, arms, cube_body_ids)
+
+    policy_endpoint = make_policy_endpoint(
+        host=policy_host,
+        port=policy_port,
+        local_port=policy_local_port,
+    )
+    policy_prompt = make_policy_prompt(prompt)
+    step_free_play = build_policy_step_free_play(
+        loaded_scene,
+        scene_module_name=scene,
+        policy_endpoint=policy_endpoint,
+        policy_prompt=policy_prompt,
+    )
+    try:
+        with shutdown_signal_as_keyboard_interrupt():
+            print(
+                f"connecting policy: {policy_endpoint.host}:{policy_endpoint.port} "
+                f"(local UDP {policy_endpoint.local_port})"
+            )
+            prewarm_step_free_play(step_free_play, model, data)
+            step_free_play(0.0, model, data)
+            ctrl = np.asarray(data.ctrl, dtype=float)
+            print(
+                "policy smoke OK: "
+                f"ctrl_shape={ctrl.shape} min={float(ctrl.min()):.4f} "
+                f"max={float(ctrl.max()):.4f} mean={float(ctrl.mean()):.4f}"
+            )
+    finally:
+        close_step_free_play(step_free_play)
 
 
 def main() -> None:

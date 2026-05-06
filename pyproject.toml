@@ -10,7 +10,8 @@ dependencies = [
     "matplotlib>=3.10.9",
     "mink>=1.1.0",
     "mujoco>=3.8.0",
-    "numpy>=2.4.4",
+    "numpy>=2.0,<3.0",
+    "openpi-flash-client",
     # 0.7.2 ships cp312/cp313 wheels; the 0.7.2.post1 tag is cp310-only, so
     # pinning to or above the post1 bound would wedge any non-3.10 environment.
     "proxsuite>=0.7.2,!=0.7.2.post1",
@@ -37,6 +38,19 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = ["mujoco_workbench", "examples"]
 module-root = ""
+
+[tool.uv]
+# Sim-local compatibility overrides for using the lightweight OpenPI client
+# adapter in the Python 3.12 / NumPy 2 MuJoCo environment. The OpenPI server
+# stack remains in its own Python 3.11 / NumPy 1.x environment.
+override-dependencies = [
+    "dm-tree>=0.1.9,!=0.1.10",
+    "numpy>=1.22.4,<3.0.0",
+]
+[tool.uv.sources]
+openpi-client = { path = "../openpi/packages/openpi-client", editable = true }
+openpi-flash-client = { path = "../hosting/packages/openpi-flash-client", editable = true }
+openpi-flash-transport = { path = "../hosting/packages/openpi-flash-transport", editable = true }
 
 [dependency-groups]
 dev = [
