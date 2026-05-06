@@ -167,6 +167,7 @@ def libero_action_to_actuator_ctrl(
         rate_dt=0.02,
         pos_tol=0.004,
         rot_tol=0.05,
+        solver="daqp",
     )
 
     actuator_ctrl = np.asarray(data.ctrl, dtype=float).copy()
