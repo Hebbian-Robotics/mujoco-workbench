@@ -44,6 +44,10 @@ module-root = ""
 # adapter in the Python 3.12 / NumPy 2 MuJoCo environment. The OpenPI server
 # stack remains in its own Python 3.11 / NumPy 1.x environment.
 override-dependencies = [
+    # dm-tree 0.1.10 (released 2026-03-31) was excluded defensively when this
+    # branch landed; sticking with 0.1.9 — the version we've validated against
+    # this sim's Py3.12 / NumPy 2 stack. Revisit and drop the !=0.1.10 pin
+    # once 0.1.10+ is exercised end-to-end.
     "dm-tree>=0.1.9,!=0.1.10",
     "numpy>=1.22.4,<3.0.0",
 ]

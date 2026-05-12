@@ -7,7 +7,8 @@ interface as closely as the local simulator stack allows:
   `robots="Panda"` default gripper more closely than the DROID Robotiq setup.
 * Camera names and preprocessing follow OpenPI's LIBERO eval path:
   `agentview` and `robot0_eye_in_hand`, rendered at 256x256, rotated 180
-  degrees, then resized/padded to 224x224.
+  degrees, then resized/padded to 224x224. The fixed `agentview` pose is
+  copied from LIBERO's `BDDLBaseDomain._setup_camera`.
 * Hosted policy actions are 7-D robosuite-style `OSC_POSE` commands. The
   scene maps them through a scratch-data IK solve into this model's
   joint-position actuators.
@@ -69,7 +70,7 @@ class _CubeTargetSpec:
 _RED_CUBE_TARGET = _CubeTargetSpec(
     body_name="red_cube",
     grippable_name="red_cube",
-    x=0.18,
+    x=-0.02,
     y=0.0,
     half_size=0.025,
     mass=0.06,
@@ -102,22 +103,40 @@ ALLOWED_STATIC_OVERLAPS: tuple[tuple[str, str], ...] = (
 # Layout constants.
 # ---------------------------------------------------------------------------
 _TABLE_HALF_X: float = 0.55
-_TABLE_HALF_Y: float = 0.35
-_TABLE_TOP_Z: float = 0.40
+_TABLE_HALF_Y: float = 0.50
+_TABLE_THICKNESS: float = 0.05
+_TABLE_TOP_Z: float = 0.80
 
-_ARM_MOUNT_X: float = -_TABLE_HALF_X + 0.14
+_ARM_MOUNT_X: float = -0.16 - _TABLE_HALF_X
 _ARM_MOUNT_Y: float = 0.0
 _ARM_MOUNT_Z: float = _TABLE_TOP_Z
 
-_FRANKA_HOME_Q: tuple[float, ...] = (0.0, -0.8, 0.0, -2.0, 0.0, 1.5, 0.8)
+_FRANKA_HOME_Q: tuple[float, ...] = (
+    0.0,
+    np.pi / 16.0,
+    0.0,
+    -np.pi / 2.0 - np.pi / 3.0,
+    0.0,
+    np.pi - 0.2,
+    np.pi / 4.0,
+)
 _PANDA_OPEN_FINGER_QPOS: float = 0.04
 
 _WRIST_CAMERA_POSITION_IN_HAND_FRAME: tuple[float, float, float] = (0.045, 0.0, 0.035)
 _WRIST_CAMERA_TARGET_IN_HAND_FRAME: tuple[float, float, float] = (0.0, 0.0, 0.16)
 _WRIST_CAMERA_UP_HINT_IN_HAND_FRAME: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
-_AGENTVIEW_CAMERA_EYE: tuple[float, float, float] = (0.42, -0.92, _TABLE_TOP_Z + 0.68)
-_AGENTVIEW_CAMERA_TARGET: tuple[float, float, float] = (0.16, -0.02, _TABLE_TOP_Z + 0.07)
+_AGENTVIEW_CAMERA_EYE: tuple[float, float, float] = (
+    0.5886131746834771,
+    0.0,
+    1.4903500240372423,
+)
+_AGENTVIEW_CAMERA_QUAT_WXYZ: tuple[float, float, float, float] = (
+    0.6380177736282349,
+    0.3048497438430786,
+    0.30484986305236816,
+    0.6380177736282349,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +242,16 @@ def _build_root() -> mjcf.RootElement:
         castshadow="false",
     )
 
-    table_body = root.worldbody.add("body", name="table", pos=[0.0, 0.0, _TABLE_TOP_Z * 0.5])
+    table_body = root.worldbody.add(
+        "body",
+        name="table",
+        pos=[0.0, 0.0, _TABLE_TOP_Z - _TABLE_THICKNESS * 0.5],
+    )
     table_body.add(
         "geom",
         name="table_top",
         type="box",
-        size=[_TABLE_HALF_X, _TABLE_HALF_Y, _TABLE_TOP_Z * 0.5],
+        size=[_TABLE_HALF_X, _TABLE_HALF_Y, _TABLE_THICKNESS * 0.5],
         material="robosuite_gray_table",
         contype=1,
         conaffinity=1,
@@ -265,12 +288,7 @@ def _build_root() -> mjcf.RootElement:
         "camera",
         name="agentview",
         pos=list(_AGENTVIEW_CAMERA_EYE),
-        xyaxes=list(
-            camera_xyaxes_for_look_at(
-                np.asarray(_AGENTVIEW_CAMERA_EYE, dtype=float),
-                np.asarray(_AGENTVIEW_CAMERA_TARGET, dtype=float),
-            )
-        ),
+        quat=list(_AGENTVIEW_CAMERA_QUAT_WXYZ),
         fovy=45.0,
     )
 

@@ -16,8 +16,8 @@ Conventions:
   reusing the joint name as Piper does.
 * Hand has two slide joints (`finger_joint1`, `finger_joint2`) coupled
   via the `split` tendon, driven by a single `actuator8`. ctrlrange is
-  `0..255`, following the same convention as the Robotiq 2F-85 the
-  upstream model borrowed from: 0 = fully open, 255 = fully closed.
+  `0..255`; in Menagerie's stock Panda hand this maps to 0 = fully closed,
+  255 = fully open.
 * The upstream MJCF has no TCP site. We add one between the fingers
   inside the `hand` body so the runner's IK + grasp-detector code has
   a stable site to read the jaw-center pose from.
@@ -62,7 +62,7 @@ FRANKA_ARM_ACTUATOR_NAMES: tuple[str, ...] = (
 
 GRIPPER_ACTUATOR_NAME = "actuator8"
 """Single tendon-driven actuator on the hand. ctrlrange 0..255 with
-0 = fully open, 255 = fully closed."""
+0 = fully closed, 255 = fully open."""
 
 GRIPPER_FINGER_JOINT_NAMES: tuple[str, str] = ("finger_joint1", "finger_joint2")
 """Two slide joints, equality-coupled and tendon-coupled to actuator8."""

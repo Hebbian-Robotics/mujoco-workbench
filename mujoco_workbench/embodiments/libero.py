@@ -33,6 +33,7 @@ class LiberoOscPoseAction:
     position_delta_normalized: np.ndarray
     rotation_delta_normalized: np.ndarray
     gripper_command: LiberoGripperCommand
+    gripper_action_normalized: float
 
 
 LIBERO_AGENTVIEW_CAMERA_NAME = LiberoCameraName.AGENTVIEW
@@ -57,6 +58,7 @@ LIBERO_ACTION_WIDTH = 7
 # +/-5 cm translation and +/-0.5 rad rotation deltas.
 LIBERO_POSITION_DELTA_SCALE_M = 0.05
 LIBERO_ROTATION_DELTA_SCALE_RAD = 0.5
+LIBERO_GRIPPER_NORMALIZED_STEP = 0.2
 
 _LIBERO_IMAGE_SHAPE: tuple[int, int, int] = (
     LIBERO_POLICY_IMAGE_SIZE,
@@ -175,6 +177,7 @@ def libero_action_to_actuator_ctrl(
     actuator_ctrl[arm.act_gripper_id] = _libero_gripper_command_to_ctrl(
         arm,
         gripper_command=action.gripper_command,
+        gripper_action_normalized=action.gripper_action_normalized,
         current_gripper_ctrl=float(data.ctrl[arm.act_gripper_id]),
     )
     return _clamped_actuator_ctrl(model, actuator_ctrl)
@@ -220,6 +223,7 @@ def _parse_libero_action(raw_action: np.ndarray) -> LiberoOscPoseAction:
         position_delta_normalized=clipped_action_row[:3],
         rotation_delta_normalized=clipped_action_row[3:6],
         gripper_command=_parse_libero_gripper_command(float(clipped_action_row[-1])),
+        gripper_action_normalized=float(clipped_action_row[-1]),
     )
 
 
@@ -302,15 +306,39 @@ def _libero_gripper_command_to_ctrl(
     arm: ArmHandles,
     *,
     gripper_command: LiberoGripperCommand,
+    gripper_action_normalized: float,
     current_gripper_ctrl: float,
 ) -> float:
     match gripper_command:
-        case LiberoGripperCommand.OPEN:
-            return arm.gripper_open
-        case LiberoGripperCommand.CLOSE:
-            return arm.gripper_closed
         case LiberoGripperCommand.HOLD:
             return current_gripper_ctrl
+        case LiberoGripperCommand.OPEN | LiberoGripperCommand.CLOSE:
+            pass
+    current_normalized = _gripper_ctrl_to_libero_normalized(arm, current_gripper_ctrl)
+    next_normalized = float(
+        np.clip(
+            current_normalized
+            + LIBERO_GRIPPER_NORMALIZED_STEP * np.sign(gripper_action_normalized),
+            -1.0,
+            1.0,
+        )
+    )
+    return _libero_normalized_gripper_to_ctrl(arm, next_normalized)
+
+
+def _gripper_ctrl_to_libero_normalized(arm: ArmHandles, gripper_ctrl: float) -> float:
+    """Map simulator gripper ctrl to robosuite's -1=open, +1=closed space."""
+    gripper_span = arm.gripper_closed - arm.gripper_open
+    if np.isclose(gripper_span, 0.0):
+        return -1.0
+    normalized_gripper = -1.0 + 2.0 * (gripper_ctrl - arm.gripper_open) / gripper_span
+    return float(np.clip(normalized_gripper, -1.0, 1.0))
+
+
+def _libero_normalized_gripper_to_ctrl(arm: ArmHandles, normalized_gripper: float) -> float:
+    clipped_normalized_gripper = float(np.clip(normalized_gripper, -1.0, 1.0))
+    interpolation = 0.5 * (clipped_normalized_gripper + 1.0)
+    return arm.gripper_open + interpolation * (arm.gripper_closed - arm.gripper_open)
 
 
 def _clamped_actuator_ctrl(model: mujoco.MjModel, actuator_ctrl: np.ndarray) -> np.ndarray:

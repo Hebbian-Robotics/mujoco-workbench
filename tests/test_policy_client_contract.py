@@ -565,7 +565,7 @@ def test_libero_policy_image_resize_rotates_training_frames() -> None:
     np.testing.assert_array_equal(policy_image[-1, -1], np.array([255, 0, 0], dtype=np.uint8))
 
 
-def test_libero_action_mapping_preserves_explicit_gripper_commands() -> None:
+def test_libero_action_mapping_applies_incremental_robosuite_gripper_commands() -> None:
     model, data = franka_libero_pi.build_spec()
     arm = get_arm_handles(model, franka_libero_pi.MANIPULATORS[0], franka_libero_pi.N_CUBES)
     franka_libero_pi.apply_initial_state(model, data, {ArmSide.LEFT: arm}, [])
@@ -578,10 +578,12 @@ def test_libero_action_mapping_preserves_explicit_gripper_commands() -> None:
     close_action = np.zeros(7, dtype=float)
     close_action[-1] = 1.0
     close_ctrl = libero_action_to_actuator_ctrl(model, data, scratch_data, arm, close_action)
-    np.testing.assert_allclose(close_ctrl[arm.act_gripper_id], arm.gripper_closed)
+    expected_close_step = arm.gripper_open + 0.1 * (arm.gripper_closed - arm.gripper_open)
+    np.testing.assert_allclose(close_ctrl[arm.act_gripper_id], expected_close_step)
 
     data.ctrl[arm.act_gripper_id] = arm.gripper_closed
     open_action = np.zeros(7, dtype=float)
     open_action[-1] = -1.0
     open_ctrl = libero_action_to_actuator_ctrl(model, data, scratch_data, arm, open_action)
-    np.testing.assert_allclose(open_ctrl[arm.act_gripper_id], arm.gripper_open)
+    expected_open_step = arm.gripper_open + 0.9 * (arm.gripper_closed - arm.gripper_open)
+    np.testing.assert_allclose(open_ctrl[arm.act_gripper_id], expected_open_step)
