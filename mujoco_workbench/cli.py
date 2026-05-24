@@ -130,6 +130,71 @@ def run(
     runner.main(argv)
 
 
+@app.command()
+def view(
+    xml: Annotated[Path, typer.Argument(help="Path to an MJCF (.xml) file.")],
+    keyframe: Annotated[
+        str | None,
+        typer.Option("--keyframe", "-k", help="Name of keyframe to load as initial state."),
+    ] = None,
+    static: Annotated[
+        bool,
+        typer.Option(help="Freeze dynamics (mj_forward only; no physics stepping)."),
+    ] = False,
+    geoms_to_hide: Annotated[
+        list[str] | None,
+        typer.Option("--hide-geom", help="Geom name to hide (alpha=0). Repeatable."),
+    ] = None,
+    geoms_to_disable_collision: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--disable-collision-geom",
+            help="Geom name whose collisions to disable. Repeatable.",
+        ),
+    ] = None,
+) -> None:
+    """Open a raw MJCF in MuJoCo's native passive viewer.
+
+    Lightweight inspection path — no Viser, Rerun, IK, or policy machinery.
+    Use this when authoring a scene, importing a third-party robot XML, or
+    debugging contact authoring on a single file. For full workbench
+    runtime use `mwb run`.
+    """
+    import time
+
+    import mujoco
+    import mujoco.viewer
+
+    from mujoco_workbench.runtime import apply_keyframe, disable_geom_collision, hide_geom
+
+    if xml.suffix.lower() != ".xml":
+        raise typer.BadParameter(f"expected an .xml file; got {xml}")
+    if not xml.exists():
+        raise typer.BadParameter(f"file not found: {xml}")
+
+    model = mujoco.MjModel.from_xml_path(str(xml))
+    data = mujoco.MjData(model)
+
+    if keyframe is not None:
+        apply_keyframe(model, data, keyframe)
+
+    for geom_name in geoms_to_disable_collision or ():
+        disable_geom_collision(model, geom_name)
+    for geom_name in geoms_to_hide or ():
+        hide_geom(model, geom_name)
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            step_start = time.time()
+            if static:
+                mujoco.mj_forward(model, data)
+            else:
+                mujoco.mj_step(model, data)
+                elapsed = time.time() - step_start
+                time.sleep(max(0.0, model.opt.timestep - elapsed))
+            viewer.sync()
+
+
 @app.command("video-export")
 def video_export(
     out_dir: Annotated[Path, typer.Option(help="Directory for the four .mp4 files")] = Path(

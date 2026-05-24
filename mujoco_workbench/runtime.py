@@ -484,6 +484,78 @@ def _parse_camera_feed(module: ModuleType, *, scene_name: SceneName) -> CameraFe
     )
 
 
+def sync_position_actuators_to_qpos(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Copy each position-actuator's actuated joint qpos into `data.ctrl`.
+
+    Without this, setting `data.qpos` directly (via keyframe load or scripted
+    home pose) leaves position actuators holding stale `ctrl=0` targets, which
+    immediately drag the model back to zero on the next step.
+    """
+    for actuator_id in range(model.nu):
+        joint_id = int(model.actuator_trnid[actuator_id, 0])
+        if joint_id < 0:
+            continue
+        data.ctrl[actuator_id] = data.qpos[int(model.jnt_qposadr[joint_id])]
+
+
+def apply_keyframe(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    keyframe: str | int,
+) -> None:
+    """Reset `data` to a named (or indexed) keyframe and sync position actuators.
+
+    Wraps `mj_resetDataKeyframe` + `sync_position_actuators_to_qpos` + `mj_forward`
+    so callers loading a `<key>` from the MJCF don't have to remember the
+    ctrl-sync step.
+    """
+    if isinstance(keyframe, str):
+        keyframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
+        if keyframe_id < 0:
+            available = [
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_KEY, i) or f"key{i}"
+                for i in range(model.nkey)
+            ]
+            raise ValueError(f"unknown keyframe {keyframe!r}; available: {available}")
+    else:
+        keyframe_id = int(keyframe)
+        if keyframe_id < 0 or keyframe_id >= model.nkey:
+            raise ValueError(
+                f"keyframe id {keyframe_id} out of range; model has {model.nkey} keyframes"
+            )
+    mujoco.mj_resetDataKeyframe(model, data, keyframe_id)
+    sync_position_actuators_to_qpos(model, data)
+    mujoco.mj_forward(model, data)
+
+
+def disable_geom_collision(model: mujoco.MjModel, geom_name: str) -> None:
+    """Zero a named geom's `contype` / `conaffinity` so it stops generating contacts.
+
+    One-way by design: the original mask isn't snapshotted, so re-enabling would
+    require the caller to remember it. The workbench only needs the disable
+    direction (scene variants that drop walls or workspace bounds at load time).
+    Raises `ValueError` if the geom isn't found.
+    """
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    if geom_id < 0:
+        raise ValueError(f"unknown geom {geom_name!r}")
+    model.geom_contype[geom_id] = 0
+    model.geom_conaffinity[geom_id] = 0
+
+
+def hide_geom(model: mujoco.MjModel, geom_name: str) -> None:
+    """Set a named geom's alpha to 0 so it stops rendering.
+
+    Only handles the hide direction: "show" would have to restore the original
+    alpha (which may not have been 1.0), and the workbench has no use case for
+    that yet. Raises `ValueError` if the geom isn't found.
+    """
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    if geom_id < 0:
+        raise ValueError(f"unknown geom {geom_name!r}")
+    model.geom_rgba[geom_id, 3] = 0.0
+
+
 def parse_world_point(raw: str, *, field_name: str) -> WorldPoint:
     """Parse `'x,y,z'` into a 3-tuple; raise on anything else.
     Parse-don't-validate at the CLI boundary."""
