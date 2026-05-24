@@ -11,6 +11,7 @@ from mujoco_workbench.arm_handles import ArmSide, ManipulatorSpec, RobotKind
 from mujoco_workbench.policy_types import PolicyEndpoint, PolicyPrompt, make_policy_endpoint
 from mujoco_workbench.runner import (
     build_policy_step_free_play,
+    clear_step_free_play_action_buffer,
     close_step_free_play,
     prewarm_step_free_play,
     reset_step_free_play,
@@ -24,6 +25,7 @@ class _FakePolicyFreePlay:
         self.prewarm_count = 0
         self.reset_count = 0
         self.close_count = 0
+        self.clear_action_buffer_count = 0
         self.tick_count = 0
         self.prompt: PolicyPrompt | None = None
 
@@ -39,6 +41,9 @@ class _FakePolicyFreePlay:
 
     def set_prompt(self, prompt: PolicyPrompt) -> None:
         self.prompt = prompt
+
+    def clear_action_buffer(self) -> None:
+        self.clear_action_buffer_count += 1
 
     def __call__(self, t: float, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         del t, model, data
@@ -106,11 +111,13 @@ def test_policy_step_free_play_factory_and_lifecycle_hooks() -> None:
     assert prewarm_step_free_play(active_step_free_play, model, data)
     assert reset_step_free_play(active_step_free_play)
     assert set_step_free_play_prompt(active_step_free_play, PolicyPrompt("place"))
+    assert clear_step_free_play_action_buffer(active_step_free_play)
     assert close_step_free_play(active_step_free_play)
     active_step_free_play(0.0, model, data)
 
     assert fake_free_play.prewarm_count == 1
     assert fake_free_play.reset_count == 1
+    assert fake_free_play.clear_action_buffer_count == 1
     assert fake_free_play.close_count == 1
     assert fake_free_play.tick_count == 1
     assert fake_free_play.prompt == PolicyPrompt("place")
@@ -125,4 +132,5 @@ def test_policy_lifecycle_helpers_ignore_plain_free_play_callbacks() -> None:
     assert not prewarm_step_free_play(plain_step_free_play, model, data)
     assert not reset_step_free_play(plain_step_free_play)
     assert not set_step_free_play_prompt(plain_step_free_play, PolicyPrompt("place"))
+    assert not clear_step_free_play_action_buffer(plain_step_free_play)
     assert not close_step_free_play(plain_step_free_play)

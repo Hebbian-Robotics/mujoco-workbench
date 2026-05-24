@@ -88,6 +88,47 @@ Useful `mwb run` flags:
 - `--start-phase PHASE`: boot from a scene-defined phase home.
 - `--rerun-port`, `--rerun-connect`, `--rerun-rrd`: stream or save Rerun data.
 
+## Hosted OpenPI Policy Scenes
+
+Hosted policy mode is optional. The default `uv sync` keeps scripted scenes,
+debug tools, and tests independent from the OpenPI hosting checkout. To run
+policy scenes, install the policy extra from an `openpi` workspace where this
+repo sits next to `../hosting` and `../openpi`:
+
+```bash
+uv sync --extra policy
+```
+
+The included policy-shaped scenes are:
+
+- `examples.scenes.franka_droid_pi`: Franka + Robotiq scene matching the
+  `pi05_droid` observation/action shape.
+- `examples.scenes.franka_libero_pi`: Franka + Panda hand scene matching the
+  `pi05_libero` observation/action shape.
+
+Check the local scene geometry before connecting to a server:
+
+```bash
+uv run mwb run examples.scenes.franka_droid_pi --inspect
+uv run mwb run examples.scenes.franka_libero_pi --inspect
+```
+
+Run against a hosted policy server:
+
+```bash
+uv run mwb run examples.scenes.franka_droid_pi \
+  --policy-host <server-ip> \
+  --policy-port 5555 \
+  --policy-local-port 5556 \
+  --prompt "pick up the red can" \
+  --policy-eval
+```
+
+Policy mode starts paused in Viser after pre-warming the hosted client. Use the
+Policy folder to edit/apply the prompt, then press play. On Linux hosts, set up
+an EGL-capable MuJoCo environment before using policy camera rendering; the
+runtime defaults `MUJOCO_GL` to `egl` on Linux and `glfw` on macOS.
+
 ## Included Examples
 
 - `examples.scenes.mobile_aloha_piper_indicator_check`: Mobile ALOHA-style base

@@ -168,6 +168,15 @@ def set_step_free_play_prompt(
     return True
 
 
+def clear_step_free_play_action_buffer(step_free_play: StepFreePlay | None) -> bool:
+    """Clear a policy free-play action buffer when the controller exposes one."""
+    free_play_clear_action_buffer = getattr(step_free_play, "clear_action_buffer", None)
+    if not callable(free_play_clear_action_buffer):
+        return False
+    free_play_clear_action_buffer()
+    return True
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -599,6 +608,7 @@ def main(argv: list[str] | None = None) -> None:
                 disabled=True,
             )
             gui_apply_policy_prompt = server.gui.add_button("apply prompt")
+            gui_clear_policy_actions = server.gui.add_button("clear action buffer")
 
         @gui_apply_policy_prompt.on_click
         def _on_apply_policy_prompt(_event: Any) -> None:
@@ -611,6 +621,13 @@ def main(argv: list[str] | None = None) -> None:
             policy_prompt = updated_policy_prompt
             set_step_free_play_prompt(active_step_free_play, updated_policy_prompt)
             gui_policy_status.value = f"applied: {updated_policy_prompt}; press play"
+
+        @gui_clear_policy_actions.on_click
+        def _on_clear_policy_actions(_event: Any) -> None:
+            if clear_step_free_play_action_buffer(active_step_free_play):
+                gui_policy_status.value = "cleared buffered actions"
+            else:
+                gui_policy_status.value = "policy controller has no action buffer"
 
     @gui_play.on_click
     def _on_play(_event: Any) -> None:
@@ -935,12 +952,15 @@ def main(argv: list[str] | None = None) -> None:
         f"then open http://localhost:{args.port}"
     )
     free_play_can_prewarm = callable(getattr(active_step_free_play, "prewarm", None))
-    if free_play_can_prewarm and not policy_mode:
+    if free_play_can_prewarm and policy_mode:
         print("Pre-warming hosted policy with the initial observation...")
         prewarm_step_free_play(active_step_free_play, model, data)
         print("Policy pre-warm complete")
-    if free_play_can_prewarm and policy_mode:
         print("Policy mode starts paused. Set/apply the prompt in the Viser UI, then press play.")
+    elif free_play_can_prewarm:
+        print("Pre-warming free-play controller with the initial scene state...")
+        prewarm_step_free_play(active_step_free_play, model, data)
+        print("Free-play pre-warm complete")
     if task_plan is not None:
         parts = ", ".join(f"{side}={len(task_plan[side])}" for side in arm_sides)
         print(f"Timeline: {parts} steps (run in parallel)")

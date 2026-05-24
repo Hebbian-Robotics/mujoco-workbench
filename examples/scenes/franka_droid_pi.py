@@ -479,6 +479,12 @@ class _FrankaDroidPolicyFreePlay:
         if self._policy_client is not None:
             self._policy_client.clear_action_buffer()
 
+    def clear_action_buffer(self) -> None:
+        """Discard queued open-loop policy actions without changing the prompt."""
+        self._next_policy_tick_time = None
+        if self._policy_client is not None:
+            self._policy_client.clear_action_buffer()
+
     def close(self) -> None:
         if self._policy_client is not None:
             self._policy_client.close()

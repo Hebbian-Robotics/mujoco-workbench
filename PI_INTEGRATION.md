@@ -15,7 +15,7 @@ camera views in viser, and end-to-end success on at least one task.
 ## Why now / context
 
 * Hosting layer (`/Users/kkuan/openpi/hosting`) ships a Python client
-  (`hosting.flash_transport_policy.FlashTransportPolicy`) that speaks
+  (`openpi_flash_client.flash_transport_policy.FlashTransportPolicy`) that speaks
   QUIC via a local Rust subprocess (`openpi-flash-transport`) to the
   remote server.
 * Sim today has zero policy integration — scenes are scripted via
@@ -65,7 +65,7 @@ scene that doesn't opt in to policy mode, it's wrong.
 
 ## Status
 
-Last updated: 2026-05-05. Tasks tracked in the agent task list (use
+Last updated: 2026-05-24. Tasks tracked in the agent task list (use
 `TaskList` to inspect).
 
 ### Done
@@ -83,17 +83,21 @@ Last updated: 2026-05-05. Tasks tracked in the agent task list (use
   (`gripper/fingers_actuator`, ctrlrange 0..255), wrist body =
   `gripper/base`, TCP site = `gripper/pinch`.
 * **Scene `examples/scenes/franka_droid_pi.py`** — Franka mounted on a
-  tabletop with 3 graspable cubes. Cameras `cam_exterior` +
+  tabletop with one graspable red can. Cameras `cam_exterior` +
   `left/gripper/cam_wrist` feed the DROID schema. Exposes
   both a no-op `step_free_play` fallback and a hosted-policy
   `make_step_free_play(policy_endpoint, prompt)` factory. Policy execution
   ticks at DROID's 15 Hz control rate and uses an 8-step open-loop window.
+* **Scene `examples/scenes/franka_libero_pi.py`** — Franka/Panda-hand tabletop
+  scene matching the LIBERO camera/action contract. It uses a raw action-chunk
+  policy client and maps 7-D robosuite-style actions through local IK before
+  writing MuJoCo joint-position controls.
 * **Headless policy rendering** in `mujoco_workbench/headless_renderer.py` —
   cached `mujoco.Renderer` instances keyed by named camera. The DROID scene
   renders policy/feed cameras at 320x180, then applies OpenPI-style
   resize-with-pad to the final 224x224 observation images.
 * **Hosted policy client wrapper** in `mujoco_workbench/policy_client.py` —
-  lazy import of `hosting.flash_transport_policy.FlashTransportPolicy`,
+  lazy import of `openpi_flash_client.flash_transport_policy.FlashTransportPolicy`,
   action-chunk buffering, timing metadata capture, reset/close hooks, and
   defensive clipping to `model.actuator_ctrlrange`. DROID velocity actions
   are integrated into position-actuator targets at 15 Hz, with the gripper
@@ -119,28 +123,26 @@ Last updated: 2026-05-05. Tasks tracked in the agent task list (use
 * **Runner policy helper tests** in `tests/test_policy_runner_helpers.py` —
   fake scene factory dispatch plus prewarm/reset/close lifecycle coverage
   without touching the real transport.
+* **Optional dependency packaging** — `openpi-flash-client` is exposed through
+  the `policy` extra instead of the default install path, so `uv sync` remains
+  usable for non-policy workflows. Local OpenPI path sources are still declared
+  for `uv sync --extra policy` in the monorepo checkout.
+* **README policy docs** — hosted policy setup, inspect commands, and the
+  end-to-end `mwb run ... --policy-host ...` invocation are documented.
 
 ### Deferred / blocked
 
-* **Dependency declaration is intentionally not added yet.** The local hosting
-  package (`/Users/kkuan/openpi/hosting`) declares `requires-python =
-  ">=3.11,<3.12"` while this sim project is locked to Python 3.12, and
-  `openpi-client` declares `numpy<2.0` while this sim uses `numpy>=2.4.4`.
-  The simulator keeps the transport import lazy so all non-policy workflows
-  keep working. Live policy mode still requires running from an environment
-  where `hosting.flash_transport_policy` and its transport dependencies are
-  importable, or relaxing/updating those upstream package constraints.
+* **Live policy verification still needs a server.** The simulator package can
+  install the hosted client via `uv sync --extra policy`, but end-to-end success
+  still depends on a running `pi05_droid` or `pi05_libero` server and the flash
+  transport sidecar being available on the sim host.
 
 ### Verified
 
-* `mwb run examples.scenes.franka_droid_pi --inspect` → `check_scene: OK`
-  (18 bodies, 12 joints, 8 actuators, 4 equalities)
-* `pytest tests/test_phase_contracts_structural.py` → 8/8 pass
-* `mwb run examples.scenes.mobile_aloha_ur10e_server_swap --inspect` →
-  still compiles (regression check on the largest scripted scene)
-* `ruff check`, `ruff format`, `ty check` clean on all changed files
-* `pytest tests/test_policy_client_contract.py tests/test_policy_runner_helpers.py tests/test_runtime_scene_loader.py`
-  → 16/16 pass
+* `uv run mwb run examples.scenes.franka_droid_pi --inspect` → `check_scene: OK`
+* `uv run mwb run examples.scenes.franka_libero_pi --inspect` → `check_scene: OK`
+* `uv run ruff check --fix`, `uv run ruff format`, `uv run ty check` clean
+* `uv run pytest` → 55/55 pass
 
 ## Remaining work
 
@@ -148,9 +150,7 @@ In rough implementation order. Each task is independently testable.
 
 ### Phase A: deps + foundational modules
 
-1. **Resolve hosted dependency packaging.** Either update the hosting stack
-   for Python 3.12 + NumPy 2.x compatibility or provide a separate policy
-   extras/env workflow. Then add the dependency path/source and run `uv sync`.
+Completed with the `policy` extra.
 
 ### Phase B: runner + CLI wiring
 
@@ -173,25 +173,17 @@ Completed.
 
 ### Phase D: polish
 
-5. **Interactive viser GUI** (only when `--policy-host` set): mirror
-    the `teleop.py:451-727` pattern.
-    * `server.gui.add_image()` for `cam_exterior` + `cam_wrist` (live
-      view of policy-input images, throttled to ~10–15 Hz)
-    * `gui.add_text("Prompt", ...)` editable prompt
-    * `gui.add_dropdown(...)` of preset prompts
-    * `gui.add_number(disabled=True)` showing `server_timing.infer_ms`
-    * Pause/resume policy button
-    * Clear action buffer button
+5. **Interactive viser GUI polish** (only when `--policy-host` set):
+    live camera feeds, editable prompt, apply prompt, pause/play, and reset are
+    wired, including an explicit clear-action-buffer button. Still useful to
+    add preset-prompt dropdowns and timing fields from `server_timing.infer_ms`.
 6. **`scripts/install_flash_transport.sh`** — fetch the
     `openpi-flash-transport` Rust binary from the GitHub release
     artifact for the host platform (darwin-arm64, linux-x86_64).
 7. **`examples/scenes/franka_action_replay_debug.py`** — replays a
     canned action chunk against ground-truth qpos. Use to verify
     position/velocity/delta interpretation BEFORE going live.
-8. **README + docs** — "Running with a hosted policy" section
-    (env vars, MUJOCO_GL=egl on Linux, connection test, end-to-end
-    command).
-9. **End-to-end verification on real EC2 server** — deploy
+8. **End-to-end verification on real EC2 server** — deploy
     `pi05_droid` with `config.example.json`, install flash-transport
     binary on sim host, run the scene with a real prompt. Iterate on
     action scaling. Run lint/typecheck.
@@ -239,7 +231,7 @@ a runtime concern documented in the README task.
 * `mujoco_workbench/welds.py` — grasp weld primitives (called by the new grasp detector)
 * `mujoco_workbench/ik.py` + `mink` — Franka EE poses
 * `mujoco_workbench/cameras.py` — viser/rerun camera metadata
-* `hosting.flash_transport_policy.FlashTransportPolicy` — QUIC client
+* `openpi_flash_client.flash_transport_policy.FlashTransportPolicy` — QUIC client
 * `hosting/src/hosting/warmup.py:61-77` — canonical DROID obs schema
 * `hosting/examples/galaxea/galaxea_client.py` — client lifecycle reference
 * `mujoco_workbench/teleop.py:451-727` — viser GUI pattern reference
@@ -249,6 +241,7 @@ a runtime concern documented in the README task.
 * `examples/paths.py` — register `FRANKA_PANDA_XML`
 * `mujoco_workbench/arm_handles.py` — `RobotKind.FRANKA_PANDA` adapter
 * `examples/scenes/franka_droid_pi.py` — hosted-policy free-play factory
+* `examples/scenes/franka_libero_pi.py` — LIBERO policy free-play factory
 * `mujoco_workbench/cli.py` — policy flags
 * `mujoco_workbench/runner.py` — policy factory dispatch + prewarm
 * `mujoco_workbench/runtime.py` — parse `make_step_free_play`
@@ -259,17 +252,19 @@ a runtime concern documented in the README task.
 
 * `examples/robots/franka_panda.py`
 * `examples/scenes/franka_droid_pi.py`
+* `examples/scenes/franka_libero_pi.py`
 * `mujoco_workbench/headless_renderer.py`
 * `mujoco_workbench/policy_client.py`
 * `mujoco_workbench/policy_types.py`
 * `mujoco_workbench/embodiments/__init__.py`
 * `mujoco_workbench/embodiments/droid.py`
+* `mujoco_workbench/embodiments/libero.py`
 * `tests/test_policy_client_contract.py`
 * `tests/test_policy_runner_helpers.py`
 
 ### Files to be modified
 
-* `pyproject.toml` (dependency packaging once upstream constraints are compatible)
+* None.
 
 ### Files to be created
 
@@ -287,12 +282,16 @@ uv run mwb run examples.scenes.mobile_aloha_ur10e_server_swap --inspect
 
 # New Franka scene compiles + obeys invariants
 uv run mwb run examples.scenes.franka_droid_pi --inspect
+uv run mwb run examples.scenes.franka_libero_pi --inspect
 
 # Lint / format / typecheck
-uv run ruff check --fix && uv run ruff format && uv run ty check
+uv run ruff check --fix
+uv run ruff format
+uv run ty check
+uv run pytest
 
 # Once policy wiring lands:
-./scripts/install_flash_transport.sh
+uv sync --extra policy
 uv run mwb run examples.scenes.franka_droid_pi \
     --policy-host <ec2-ip> --prompt "pick up the red cube" --policy-eval
 ```
