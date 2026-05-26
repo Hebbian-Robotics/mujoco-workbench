@@ -11,8 +11,9 @@ from typing import Protocol, cast
 import mujoco
 import numpy as np
 
-from mujoco_workbench.embodiments.droid import DROID_CONTROL_PERIOD_SECONDS
 from mujoco_workbench.policy_types import PolicyActionInterpretation, PolicyEndpoint
+
+DROID_DEFAULT_CONTROL_PERIOD_SECONDS = 1.0 / 15.0
 
 
 class HostedPolicy(Protocol):
@@ -82,7 +83,7 @@ class HostedPolicyClient:
             PolicyActionInterpretation.DIRECT_ACTUATOR_CTRL
         ),
         max_buffered_actions: int | None = None,
-        droid_velocity_time_step_seconds: float = DROID_CONTROL_PERIOD_SECONDS,
+        droid_velocity_time_step_seconds: float = DROID_DEFAULT_CONTROL_PERIOD_SECONDS,
         policy_factory: PolicyFactory = _default_policy_factory,
     ) -> None:
         if max_buffered_actions is not None and max_buffered_actions <= 0:
