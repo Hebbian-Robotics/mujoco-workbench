@@ -99,12 +99,23 @@ repo sits next to `../hosting` and `../openpi`:
 uv sync --extra policy
 ```
 
+The extra installs the lightweight hosted client and uses local path sources
+declared in `pyproject.toml`:
+
+- `../hosting/packages/openpi-flash-client`
+- `../hosting/packages/openpi-flash-transport`
+- `../openpi/packages/openpi-client`
+
 The included policy-shaped scenes are:
 
 - `examples.scenes.franka_droid_pi`: Franka + Robotiq scene matching the
-  `pi05_droid` observation/action shape.
+  `pi05_droid` observation/action shape. It renders `cam_exterior` and
+  `left/gripper/cam_wrist`, builds DROID observations, and applies hosted
+  action chunks as actuator controls.
 - `examples.scenes.franka_libero_pi`: Franka + Panda hand scene matching the
-  `pi05_libero` observation/action shape.
+  `pi05_libero` observation/action shape. It renders LIBERO-style camera
+  observations and maps raw 7-D OSC_POSE actions through local IK before
+  writing joint-position controls.
 
 Check the local scene geometry before connecting to a server:
 
@@ -128,6 +139,42 @@ Policy mode starts paused in Viser after pre-warming the hosted client. Use the
 Policy folder to edit/apply the prompt, then press play. On Linux hosts, set up
 an EGL-capable MuJoCo environment before using policy camera rendering; the
 runtime defaults `MUJOCO_GL` to `egl` on Linux and `glfw` on macOS.
+
+Policy support is layered on top of the existing runtime:
+
+- Plain `mwb run <scene>` still uses scripted task plans or `step_free_play`.
+- `mwb run <scene> --policy-host ...` uses the scene's
+  `make_step_free_play(policy_endpoint=..., prompt=...)` factory.
+- `--policy-eval` evaluates phase contracts without raising through strict
+  mode, which is useful for rollouts that should log failures rather than stop.
+- Policy clients are closed on runner exit and can be reset or have their
+  buffered open-loop actions cleared from the Viser Policy folder.
+
+The durable policy modules are:
+
+- `mujoco_workbench.policy_client`: hosted client wrapper, action parsing,
+  buffering, timing metadata, clipping, and reset/close lifecycle.
+- `mujoco_workbench.policy_types`: parsed endpoint, prompt, and explicit action
+  interpretation variants.
+- `mujoco_workbench.headless_renderer`: cached named-camera rendering for policy
+  observations and Viser camera feeds.
+- `mujoco_workbench.embodiments.droid` and
+  `mujoco_workbench.embodiments.libero`: OpenPI-specific observation/image
+  adapters.
+
+Default test runs intentionally skip OpenPI embodiment adapter tests when
+`openpi_client` is not installed. Run `uv sync --extra policy` to exercise those
+tests locally.
+
+Current limitations:
+
+- End-to-end success still depends on a running `pi05_droid` or `pi05_libero`
+  server and a working flash transport sidecar on the sim host.
+- Action-space calibration is model-specific. Verify position, velocity, delta,
+  and gripper conventions against the hosted checkpoint before trusting a live
+  rollout.
+- Policy evaluation currently reuses phase contract monitoring, but richer
+  rollout scoring/logging is still future work.
 
 ## Included Examples
 
@@ -357,4 +404,13 @@ uv run mwb run examples.scenes.mobile_aloha_piper_indicator_check --inspect
 uv run mwb debug contracts \
   --scene examples.scenes.mobile_aloha_piper_indicator_check \
   --out-root results/runs
+```
+
+For hosted policy changes, also run:
+
+```bash
+uv run mwb run examples.scenes.franka_droid_pi --inspect
+uv run mwb run examples.scenes.franka_libero_pi --inspect
+uv sync --extra policy
+uv run pytest tests/test_policy_client_contract.py tests/test_policy_embodiments_contract.py
 ```
