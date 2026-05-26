@@ -61,6 +61,26 @@ def run(
         int,
         typer.Option(help="Include named-camera frames every N render ticks; 0 disables."),
     ] = 0,
+    policy_host: Annotated[
+        str | None,
+        typer.Option(help="Hosted OpenPI policy server host. Enables policy free-play mode."),
+    ] = None,
+    policy_port: Annotated[
+        int,
+        typer.Option(help="Hosted OpenPI policy server QUIC port."),
+    ] = 5555,
+    policy_local_port: Annotated[
+        int,
+        typer.Option(help="Local UDP port used by the OpenPI flash transport sidecar."),
+    ] = 5556,
+    prompt: Annotated[
+        str,
+        typer.Option(help="Language instruction sent to the hosted policy."),
+    ] = "do something",
+    policy_eval: Annotated[
+        bool,
+        typer.Option(help="Run phase contracts in non-raising policy evaluation mode."),
+    ] = False,
 ) -> None:
     """Run an interactive Viser scene."""
     from mujoco_workbench import runner
@@ -97,7 +117,82 @@ def run(
         argv.extend(["--rerun-connect", rerun_connect])
     if rerun_rrd is not None:
         argv.extend(["--rerun-rrd", str(rerun_rrd)])
+    if policy_host is not None:
+        argv.extend(["--policy-host", policy_host])
+    if policy_port != 5555:
+        argv.extend(["--policy-port", str(policy_port)])
+    if policy_local_port != 5556:
+        argv.extend(["--policy-local-port", str(policy_local_port)])
+    if prompt != "do something":
+        argv.extend(["--prompt", prompt])
+    if policy_eval:
+        argv.append("--policy-eval")
     runner.main(argv)
+
+
+@app.command()
+def view(
+    xml: Annotated[Path, typer.Argument(help="Path to an MJCF (.xml) file.")],
+    keyframe: Annotated[
+        str | None,
+        typer.Option("--keyframe", "-k", help="Name of keyframe to load as initial state."),
+    ] = None,
+    static: Annotated[
+        bool,
+        typer.Option(help="Freeze dynamics (mj_forward only; no physics stepping)."),
+    ] = False,
+    geoms_to_hide: Annotated[
+        list[str] | None,
+        typer.Option("--hide-geom", help="Geom name to hide (alpha=0). Repeatable."),
+    ] = None,
+    geoms_to_disable_collision: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--disable-collision-geom",
+            help="Geom name whose collisions to disable. Repeatable.",
+        ),
+    ] = None,
+) -> None:
+    """Open a raw MJCF in MuJoCo's native passive viewer.
+
+    Lightweight inspection path — no Viser, Rerun, IK, or policy machinery.
+    Use this when authoring a scene, importing a third-party robot XML, or
+    debugging contact authoring on a single file. For full workbench
+    runtime use `mwb run`.
+    """
+    import time
+
+    import mujoco
+    import mujoco.viewer
+
+    from mujoco_workbench.runtime import apply_keyframe, disable_geom_collision, hide_geom
+
+    if xml.suffix.lower() != ".xml":
+        raise typer.BadParameter(f"expected an .xml file; got {xml}")
+    if not xml.exists():
+        raise typer.BadParameter(f"file not found: {xml}")
+
+    model = mujoco.MjModel.from_xml_path(str(xml))
+    data = mujoco.MjData(model)
+
+    if keyframe is not None:
+        apply_keyframe(model, data, keyframe)
+
+    for geom_name in geoms_to_disable_collision or ():
+        disable_geom_collision(model, geom_name)
+    for geom_name in geoms_to_hide or ():
+        hide_geom(model, geom_name)
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            step_start = time.time()
+            if static:
+                mujoco.mj_forward(model, data)
+            else:
+                mujoco.mj_step(model, data)
+                elapsed = time.time() - step_start
+                time.sleep(max(0.0, model.opt.timestep - elapsed))
+            viewer.sync()
 
 
 @app.command("video-export")
@@ -131,6 +226,90 @@ def video_export(
         crf=crf,
         preset=preset,
     )
+
+
+@app.command("policy-smoke")
+def policy_smoke(
+    scene: Annotated[
+        str,
+        typer.Argument(help="Fully qualified policy-capable scene module."),
+    ],
+    policy_host: Annotated[
+        str,
+        typer.Option(help="Hosted OpenPI policy server host."),
+    ],
+    policy_port: Annotated[
+        int,
+        typer.Option(help="Hosted OpenPI policy server QUIC port."),
+    ] = 5555,
+    policy_local_port: Annotated[
+        int,
+        typer.Option(help="Local UDP port used by the OpenPI flash transport sidecar."),
+    ] = 5556,
+    prompt: Annotated[
+        str,
+        typer.Option(help="Language instruction sent to the hosted policy."),
+    ] = "do something",
+) -> None:
+    """Headless one-step hosted-policy smoke test."""
+    import mujoco
+    import numpy as np
+
+    from mujoco_workbench.arm_handles import get_arm_handles
+    from mujoco_workbench.policy_types import make_policy_endpoint, make_policy_prompt
+    from mujoco_workbench.runner import (
+        build_policy_step_free_play,
+        close_step_free_play,
+        prewarm_step_free_play,
+        shutdown_signal_as_keyboard_interrupt,
+    )
+    from mujoco_workbench.runtime import load_scene
+
+    loaded_scene = load_scene(scene)
+    print(f"Loading {scene} ...")
+    model, data = loaded_scene.build_spec()
+    print(
+        f"compiled: nbody={model.nbody} njnt={model.njnt} nu={model.nu} "
+        f"neq={model.neq} ngeom={model.ngeom}"
+    )
+    cube_body_ids = [
+        int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, grippable_name))
+        for grippable_name in loaded_scene.grippable_names
+    ]
+    arms = {
+        manipulator.side: get_arm_handles(model, manipulator, loaded_scene.n_cubes)
+        for manipulator in loaded_scene.manipulators
+    }
+    loaded_scene.apply_initial_state(model, data, arms, cube_body_ids)
+
+    policy_endpoint = make_policy_endpoint(
+        host=policy_host,
+        port=policy_port,
+        local_port=policy_local_port,
+    )
+    policy_prompt = make_policy_prompt(prompt)
+    step_free_play = build_policy_step_free_play(
+        loaded_scene,
+        scene_module_name=scene,
+        policy_endpoint=policy_endpoint,
+        policy_prompt=policy_prompt,
+    )
+    try:
+        with shutdown_signal_as_keyboard_interrupt():
+            print(
+                f"connecting policy: {policy_endpoint.host}:{policy_endpoint.port} "
+                f"(local UDP {policy_endpoint.local_port})"
+            )
+            prewarm_step_free_play(step_free_play, model, data)
+            step_free_play(0.0, model, data)
+            ctrl = np.asarray(data.ctrl, dtype=float)
+            print(
+                "policy smoke OK: "
+                f"ctrl_shape={ctrl.shape} min={float(ctrl.min()):.4f} "
+                f"max={float(ctrl.max()):.4f} mean={float(ctrl.mean()):.4f}"
+            )
+    finally:
+        close_step_free_play(step_free_play)
 
 
 def main() -> None:

@@ -80,6 +80,7 @@ _MENAGERIE_XMLS: dict[str, tuple[str, ...]] = {
     "ROBOTIQ_2F85_XML": ("robotiq_2f85", "2f85.xml"),
     "TIAGO_XML": ("pal_tiago", "tiago.xml"),
     "D435I_XML": ("realsense_d435i", "d435i.xml"),
+    "FRANKA_PANDA_XML": ("franka_emika_panda", "panda.xml"),
 }
 
 _MENAGERIE_MESHES: dict[str, tuple[str, ...]] = {
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     ROBOTIQ_2F85_XML: MenagerieXml
     TIAGO_XML: MenagerieXml
     D435I_XML: MenagerieXml
+    FRANKA_PANDA_XML: MenagerieXml
     D405_MESH_STL: MenagerieMesh
 
 

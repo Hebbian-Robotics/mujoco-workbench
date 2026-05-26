@@ -3,7 +3,7 @@
 `get_arm_handles(model, manipulator, n_cubes)` returns an `ArmHandles`
 carrying the qpos/dof/actuator/body indices the runner + IK code use to
 drive one prefixed arm. Robot-specific naming lives in `ROBOT_ADAPTERS`.
-Two robot families are currently supported:
+Supported robot families:
 
 * `"piper"` — AgileX Piper 6-DoF arm + parallel-jaw with two
   tendon-coupled finger slide joints. `qpos_idx` / `dof_idx` are
@@ -13,6 +13,10 @@ Two robot families are currently supported:
   (ctrl 0..255); finger qpos is NOT puppet-written — the actuator
   pushes the tendon equality and the linkage settles.
   `qpos_idx` / `dof_idx` are length-6 (no finger entries).
+* `"franka_panda"` — stock Menagerie Franka Panda arm + hand.
+* `"franka_panda_robotiq_2f85"` — DROID-shaped Franka Panda arm with a
+  Robotiq 2F-85 on the flange. The arm still has 7 controlled joints;
+  the gripper follows the same actuator convention as UR10e+2F-85.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ class RobotKind(StrEnum):
 
     PIPER = "piper"
     UR10E = "ur10e"
+    FRANKA_PANDA = "franka_panda"
+    FRANKA_PANDA_ROBOTIQ_2F85 = "franka_panda_robotiq_2f85"
 
 
 class ArmSide(StrEnum):
@@ -102,6 +108,14 @@ _UR10E_ARM_JOINT_SUFFIXES: tuple[str, ...] = (
 """UR10e arm DoFs in canonical chain order. 2F-85 finger joints are
 tendon-driven and not addressed through `qpos_idx` / `dof_idx`."""
 
+_FRANKA_PANDA_ARM_JOINT_SUFFIXES: tuple[str, ...] = tuple(f"joint{i}" for i in range(1, 8))
+"""Franka Panda 7-DoF arm joints. Hand finger joints (`finger_joint1`,
+`finger_joint2`) are tendon-coupled via actuator8 — UR10e-shaped, not
+Piper-shaped — so they're not addressed through `qpos_idx` / `dof_idx`."""
+
+_FRANKA_PANDA_ROBOTIQ_ARM_JOINT_SUFFIXES: tuple[str, ...] = _FRANKA_PANDA_ARM_JOINT_SUFFIXES
+"""Franka Panda arm joints with a Robotiq 2F-85 gripper attached."""
+
 
 ROBOT_ADAPTERS: Mapping[RobotKind, RobotAdapter] = {
     RobotKind.PIPER: RobotAdapter(
@@ -129,6 +143,27 @@ ROBOT_ADAPTERS: Mapping[RobotKind, RobotAdapter] = {
         gripper_actuator_suffix="gripper/fingers_actuator",
         wrist_body_suffix="wrist_3_link",
         tcp_site_suffix="tcp",
+    ),
+    RobotKind.FRANKA_PANDA: RobotAdapter(
+        robot_kind=RobotKind.FRANKA_PANDA,
+        joint_suffixes=_FRANKA_PANDA_ARM_JOINT_SUFFIXES,
+        controlled_arm_joint_count=7,
+        arm_actuator_suffixes=tuple(f"actuator{i}" for i in range(1, 8)),
+        gripper_actuator_suffix="actuator8",
+        # `hand` is the rigid-body parent of the parallel-jaw fingers; it's
+        # where grasp welds anchor (analogous to UR10e using `wrist_3_link`,
+        # the 2F-85 mount frame, not the kinematic wrist link itself).
+        wrist_body_suffix="hand",
+        tcp_site_suffix="tcp",
+    ),
+    RobotKind.FRANKA_PANDA_ROBOTIQ_2F85: RobotAdapter(
+        robot_kind=RobotKind.FRANKA_PANDA_ROBOTIQ_2F85,
+        joint_suffixes=_FRANKA_PANDA_ROBOTIQ_ARM_JOINT_SUFFIXES,
+        controlled_arm_joint_count=7,
+        arm_actuator_suffixes=tuple(f"actuator{i}" for i in range(1, 8)),
+        gripper_actuator_suffix="gripper/fingers_actuator",
+        wrist_body_suffix="gripper/base",
+        tcp_site_suffix="gripper/pinch",
     ),
 }
 
@@ -279,6 +314,12 @@ def get_arm_handles(
             int(model.jnt_dofadr[first_gripper_joint_id]),
             int(model.jnt_dofadr[second_gripper_joint_id]),
         )
+    elif adapter.robot_kind is RobotKind.FRANKA_PANDA:
+        # Menagerie's stock Panda hand remaps the original 0..0.04 m
+        # finger-position actuator to a 0..255 ctrlrange. 255 is open
+        # (0.04 m), 0 is closed.
+        gripper_open = 255.0
+        gripper_closed = 0.0
     else:
         # Robotiq 2F-85 ctrlrange: 0 fully open, 255 fully closed.
         gripper_open = 0.0

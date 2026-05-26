@@ -4,24 +4,29 @@ version = "0.1.0"
 description = "MuJoCo robotics simulation workbench with Viser, Rerun, and agent-friendly tooling."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "dm-control>=1.0.40",
+    "dm-control>=1.0.41",
     "imageio[ffmpeg]>=2.37.3",
     "jaxtyping>=0.3.9",
     "matplotlib>=3.10.9",
-    "mink>=1.1.0",
-    "mujoco>=3.8.0",
-    "numpy>=2.4.4",
+    "mink>=1.1.1",
+    "mujoco>=3.8.1",
+    "numpy>=2.4.5,<3.0",
     # 0.7.2 ships cp312/cp313 wheels; the 0.7.2.post1 tag is cp310-only, so
     # pinning to or above the post1 bound would wedge any non-3.10 environment.
-    "proxsuite>=0.7.2,!=0.7.2.post1",
+    "proxsuite>=0.7.3,!=0.7.2.post1",
     # `rerun-sdk` is the rerun.io visualization tool (3D + scalars +
     # text logs + camera frames). The bare `rerun` package on PyPI is
     # an unrelated file-change-detector library — do NOT swap them.
     # Both expose the `rerun` import namespace; pinning rerun-sdk
     # specifically avoids the namespace collision warning.
-    "rerun-sdk>=0.31.4",
-    "typer>=0.25.0",
-    "viser>=1.0.26",
+    "rerun-sdk>=0.32.1",
+    "typer>=0.25.1",
+    "viser>=1.0.27",
+]
+
+[project.optional-dependencies]
+policy = [
+    "openpi-flash-client",
 ]
 
 [project.scripts]
@@ -30,7 +35,7 @@ mwb = "mujoco_workbench.cli:main"
 
 [build-system]
 requires = [
-    "uv_build>=0.11.8", #
+    "uv_build>=0.11.8,<0.12",
 ]
 build-backend = "uv_build"
 
@@ -38,12 +43,30 @@ build-backend = "uv_build"
 module-name = ["mujoco_workbench", "examples"]
 module-root = ""
 
+[tool.uv]
+exclude-newer = "7d"
+# Sim-local compatibility overrides for using the lightweight OpenPI client
+# adapter in the Python 3.12 / NumPy 2 MuJoCo environment. The OpenPI server
+# stack remains in its own Python 3.11 / NumPy 1.x environment.
+override-dependencies = [
+    # dm-tree 0.1.10 (released 2026-03-31) was excluded defensively when this
+    # branch landed; sticking with 0.1.9 — the version we've validated against
+    # this sim's Py3.12 / NumPy 2 stack. Revisit and drop the !=0.1.10 pin
+    # once 0.1.10+ is exercised end-to-end.
+    "dm-tree>=0.1.9,!=0.1.10",
+    "numpy>=1.22.4,<3.0.0",
+]
+[tool.uv.sources]
+openpi-client = { path = "../openpi/packages/openpi-client", editable = true }
+openpi-flash-client = { path = "../hosting/packages/openpi-flash-client", editable = true }
+openpi-flash-transport = { path = "../hosting/packages/openpi-flash-transport", editable = true }
+
 [dependency-groups]
 dev = [
-    "hypothesis>=6.152.4",
+    "hypothesis>=6.152.7",
     "pytest>=9.0.3",
-    "ruff>=0.15.12",       #
-    "ty>=0.0.33",
+    "ruff>=0.15.13",
+    "ty>=0.0.37",
 ]
 
 [tool.pytest.ini_options]

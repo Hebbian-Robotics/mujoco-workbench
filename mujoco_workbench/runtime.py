@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, NewType, cast
+from typing import Any, Literal, NewType, Protocol, cast
 
 # Pick a safe MuJoCo GL backend before importing mujoco. Linux EC2 needs
 # EGL for headless rendering; macOS rejects `egl`, so use GLFW there.
@@ -42,6 +42,7 @@ from mujoco_workbench.arm_handles import (  # noqa: E402
     parse_robot_kind,
 )
 from mujoco_workbench.cameras import CameraRole  # noqa: E402
+from mujoco_workbench.policy_types import PolicyEndpoint, PolicyPrompt  # noqa: E402
 from mujoco_workbench.scene_base import (  # noqa: E402
     MobileBaseTarget,
     PhaseContract,
@@ -68,6 +69,19 @@ MakeTaskPlan = Callable[
     dict[ArmSide, list[Step]],
 ]
 StepFreePlay = Callable[[float, mujoco.MjModel, mujoco.MjData], None]
+PreprocessCameraFeed = Callable[[str, np.ndarray], np.ndarray]
+
+
+class MakeStepFreePlay(Protocol):
+    """Policy free-play factory contract parsed from scene modules."""
+
+    def __call__(
+        self,
+        *,
+        policy_endpoint: PolicyEndpoint,
+        prompt: PolicyPrompt,
+    ) -> StepFreePlay:
+        """Return the free-play callback used by the runner in policy mode."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +96,15 @@ class LiftSpec:
     """Scene-owned vertical lift actuator parsed at the module boundary."""
 
     actuator_name: str
+
+
+@dataclass(frozen=True)
+class CameraFeedSpec:
+    """Scene-owned camera feed rendering options for Viser debug images."""
+
+    render_width: int
+    render_height: int
+    preprocess: PreprocessCameraFeed | None
 
 
 @dataclass(frozen=True)
@@ -114,6 +137,7 @@ class LoadedScene:
     apply_initial_state_callback: ApplyInitialState
     supports_start_phase: bool
     make_task_plan: MakeTaskPlan | None
+    make_step_free_play: MakeStepFreePlay | None
     step_free_play: StepFreePlay | None
     manipulators: tuple[ManipulatorSpec, ...]
     arm_sides: tuple[ArmSide, ...]
@@ -128,6 +152,7 @@ class LoadedScene:
     camera_invariants: tuple[CameraInvariant, ...]
     phase_contracts: tuple[PhaseContract, ...]
     cameras: tuple[tuple[str, CameraRole], ...]
+    camera_feed: CameraFeedSpec
     ik_locked_joint_names: tuple[str, ...]
     ik_seed_q: np.ndarray | None
 
@@ -392,6 +417,9 @@ def load_scene(name: SceneName | str) -> LoadedScene:
     build_spec = _required_callable(module, scene_name, "build_spec")
     apply_initial_state = _required_callable(module, scene_name, "apply_initial_state")
     make_task_plan = _optional_callable(module, "make_task_plan")
+    make_step_free_play = cast(
+        MakeStepFreePlay | None, _optional_callable(module, "make_step_free_play")
+    )
     step_free_play = _optional_callable(module, "step_free_play")
     supports_start_phase = "start_phase" in inspect.signature(apply_initial_state).parameters
     robot_kind = _parse_scene_robot_kind(getattr(module, "ROBOT_KIND", RobotKind.PIPER), scene_name)
@@ -413,6 +441,7 @@ def load_scene(name: SceneName | str) -> LoadedScene:
         apply_initial_state_callback=apply_initial_state,
         supports_start_phase=supports_start_phase,
         make_task_plan=make_task_plan,
+        make_step_free_play=make_step_free_play,
         step_free_play=step_free_play,
         manipulators=manipulators,
         arm_sides=tuple(manipulator.side for manipulator in manipulators),
@@ -427,6 +456,7 @@ def load_scene(name: SceneName | str) -> LoadedScene:
         camera_invariants=tuple(_tuple_attr(module, "CAMERA_INVARIANTS")),
         phase_contracts=tuple(_tuple_attr(module, "PHASE_CONTRACTS")),
         cameras=tuple(_tuple_attr(module, "CAMERAS")),
+        camera_feed=_parse_camera_feed(module, scene_name=scene_name),
         ik_locked_joint_names=tuple(
             str(name) for name in _tuple_attr(module, "IK_LOCKED_JOINT_NAMES")
         ),
@@ -434,6 +464,96 @@ def load_scene(name: SceneName | str) -> LoadedScene:
             np.asarray(module.IK_SEED_Q, dtype=float) if hasattr(module, "IK_SEED_Q") else None
         ),
     )
+
+
+def _parse_camera_feed(module: ModuleType, *, scene_name: SceneName) -> CameraFeedSpec:
+    render_width = int(getattr(module, "CAMERA_FEED_RENDER_WIDTH", 224))
+    render_height = int(getattr(module, "CAMERA_FEED_RENDER_HEIGHT", 224))
+    if render_width <= 0 or render_height <= 0:
+        raise ValueError(
+            f"scene {scene_name!r} camera feed render dimensions must be positive, "
+            f"got width={render_width}, height={render_height}"
+        )
+    return CameraFeedSpec(
+        render_width=render_width,
+        render_height=render_height,
+        preprocess=cast(
+            PreprocessCameraFeed | None,
+            _optional_callable(module, "preprocess_camera_feed"),
+        ),
+    )
+
+
+def sync_position_actuators_to_qpos(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Copy each position-actuator's actuated joint qpos into `data.ctrl`.
+
+    Without this, setting `data.qpos` directly (via keyframe load or scripted
+    home pose) leaves position actuators holding stale `ctrl=0` targets, which
+    immediately drag the model back to zero on the next step.
+    """
+    for actuator_id in range(model.nu):
+        joint_id = int(model.actuator_trnid[actuator_id, 0])
+        if joint_id < 0:
+            continue
+        data.ctrl[actuator_id] = data.qpos[int(model.jnt_qposadr[joint_id])]
+
+
+def apply_keyframe(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    keyframe: str | int,
+) -> None:
+    """Reset `data` to a named (or indexed) keyframe and sync position actuators.
+
+    Wraps `mj_resetDataKeyframe` + `sync_position_actuators_to_qpos` + `mj_forward`
+    so callers loading a `<key>` from the MJCF don't have to remember the
+    ctrl-sync step.
+    """
+    if isinstance(keyframe, str):
+        keyframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
+        if keyframe_id < 0:
+            available = [
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_KEY, i) or f"key{i}"
+                for i in range(model.nkey)
+            ]
+            raise ValueError(f"unknown keyframe {keyframe!r}; available: {available}")
+    else:
+        keyframe_id = int(keyframe)
+        if keyframe_id < 0 or keyframe_id >= model.nkey:
+            raise ValueError(
+                f"keyframe id {keyframe_id} out of range; model has {model.nkey} keyframes"
+            )
+    mujoco.mj_resetDataKeyframe(model, data, keyframe_id)
+    sync_position_actuators_to_qpos(model, data)
+    mujoco.mj_forward(model, data)
+
+
+def disable_geom_collision(model: mujoco.MjModel, geom_name: str) -> None:
+    """Zero a named geom's `contype` / `conaffinity` so it stops generating contacts.
+
+    One-way by design: the original mask isn't snapshotted, so re-enabling would
+    require the caller to remember it. The workbench only needs the disable
+    direction (scene variants that drop walls or workspace bounds at load time).
+    Raises `ValueError` if the geom isn't found.
+    """
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    if geom_id < 0:
+        raise ValueError(f"unknown geom {geom_name!r}")
+    model.geom_contype[geom_id] = 0
+    model.geom_conaffinity[geom_id] = 0
+
+
+def hide_geom(model: mujoco.MjModel, geom_name: str) -> None:
+    """Set a named geom's alpha to 0 so it stops rendering.
+
+    Only handles the hide direction: "show" would have to restore the original
+    alpha (which may not have been 1.0), and the workbench has no use case for
+    that yet. Raises `ValueError` if the geom isn't found.
+    """
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    if geom_id < 0:
+        raise ValueError(f"unknown geom {geom_name!r}")
+    model.geom_rgba[geom_id, 3] = 0.0
 
 
 def parse_world_point(raw: str, *, field_name: str) -> WorldPoint:
