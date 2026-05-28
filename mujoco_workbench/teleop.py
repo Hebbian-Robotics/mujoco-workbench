@@ -49,7 +49,14 @@ import numpy as np
 import viser
 
 from examples.scenes.mobile_aloha_ur10e_server_swap_layout import BASE_HOME_POSE, HOME_ARM_Q_BY_SIDE
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    write_gripper_target,
+)
+from mujoco_workbench.arm_handles import (
+    arm_joint_labels as resolve_arm_joint_labels,
+)
 from mujoco_workbench.ik import PositionOnly, solve_ik
 from mujoco_workbench.observability import check_phase_state
 from mujoco_workbench.scene_base import (
@@ -487,7 +494,7 @@ class TeleopController:
             for side in self.arms:
                 arm_label = side.rstrip("/") or "arm"
                 arm = self.arms[side]
-                arm_joint_labels = arm_joint_suffixes(arm.robot_kind)
+                arm_joint_labels = resolve_arm_joint_labels(arm)
                 seed = marker_seeds[side]
                 with self.server.gui.add_folder(f"{arm_label} arm"):
                     # --- TCP body-frame target sliders ----------------
@@ -794,17 +801,7 @@ class TeleopController:
             )
 
             target_g = arm.gripper_open if state.gripper == "open" else arm.gripper_closed
-            self.data.ctrl[arm.act_gripper_id] = target_g
-            if (
-                arm.piper_mirrored_gripper_qpos_idx is not None
-                and arm.piper_mirrored_gripper_dof_idx is not None
-            ):
-                left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
-                left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
-                self.data.qpos[left_gripper_qpos_idx] = target_g
-                self.data.qpos[right_gripper_qpos_idx] = -target_g
-                self.data.qvel[left_gripper_dof_idx] = 0.0
-                self.data.qvel[right_gripper_dof_idx] = 0.0
+            write_gripper_target(self.data, arm, target_g)
 
         if self._ik_pos_err_text is not None:
             self._ik_pos_err_text.value = (
@@ -877,7 +874,7 @@ class TeleopController:
                 self.model,
                 self.data,
                 int(arm.weld_ids[new_idx]),
-                arm.link6_id,
+                arm.grasp_body_id,
                 self.cube_body_ids[new_idx],
                 arm.tcp_site_id,
             )

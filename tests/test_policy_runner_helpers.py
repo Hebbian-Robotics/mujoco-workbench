@@ -7,7 +7,7 @@ from types import ModuleType
 
 import mujoco
 
-from mujoco_workbench.arm_handles import ArmSide, ManipulatorSpec, RobotKind
+from mujoco_workbench.arm_handles import ArmSide, franka_panda_manipulator_spec
 from mujoco_workbench.policy_types import PolicyEndpoint, PolicyPrompt, make_policy_endpoint
 from mujoco_workbench.runner import (
     build_policy_step_free_play,
@@ -67,7 +67,7 @@ def _make_model_and_data() -> tuple[mujoco.MjModel, mujoco.MjData]:
 
 def _install_policy_scene_module(module_name: str, fake_free_play: _FakePolicyFreePlay) -> None:
     module = ModuleType(module_name)
-    module.MANIPULATORS = (ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.FRANKA_PANDA),)
+    module.MANIPULATORS = (franka_panda_manipulator_spec(ArmSide.LEFT),)
 
     def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         return _make_model_and_data()

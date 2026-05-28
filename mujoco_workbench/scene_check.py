@@ -281,14 +281,9 @@ bodies (rack sitting 2 m+ away) before IK runs. The strict guard is
 `_snap_factory`'s 2 cm IK-residual abort."""
 
 
-def _arm_base_world_pos(
-    model: mujoco.MjModel, data: mujoco.MjData, side: ArmSide
-) -> np.ndarray | None:
-    """World position of `{side}base_link`, or None if the body isn't present."""
-    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}base_link")
-    if bid < 0:
-        return None
-    return np.asarray(data.xpos[bid], dtype=float)
+def _arm_base_world_pos(data: mujoco.MjData, arm: ArmHandles) -> np.ndarray:
+    """World position of the manipulator base body declared by the scene."""
+    return np.asarray(data.xpos[arm.base_body_id], dtype=float)
 
 
 # -----------------------------------------------------------------------------
@@ -400,10 +395,8 @@ def _check_grippables_reachable(
 ) -> list[SceneCheckViolation]:
     out: list[SceneCheckViolation] = []
     arm_bases: list[tuple[ArmSide, np.ndarray]] = []
-    for side in arms:
-        bp = _arm_base_world_pos(model, data, side)
-        if bp is not None:
-            arm_bases.append((side, bp))
+    for side, arm in arms.items():
+        arm_bases.append((side, _arm_base_world_pos(data, arm)))
     if not arm_bases:
         return out  # no arms declared — nothing to reach-check
 
@@ -622,13 +615,12 @@ def print_schematic(
     print()
     print("Arms at home pose:")
     for side, arm in arms.items():
-        base = _arm_base_world_pos(model, data, side)
+        base = _arm_base_world_pos(data, arm)
         tcp = np.asarray(data.site_xpos[arm.tcp_site_id], dtype=float)
-        if base is not None:
-            print(
-                f"  [{side}] base=({base[0]:+.3f}, {base[1]:+.3f}, {base[2]:+.3f})"
-                f"  tcp=({tcp[0]:+.3f}, {tcp[1]:+.3f}, {tcp[2]:+.3f})"
-            )
+        print(
+            f"  [{side}] base=({base[0]:+.3f}, {base[1]:+.3f}, {base[2]:+.3f})"
+            f"  tcp=({tcp[0]:+.3f}, {tcp[1]:+.3f}, {tcp[2]:+.3f})"
+        )
 
     if grippable_names:
         print()
@@ -640,10 +632,9 @@ def print_schematic(
                 continue
             gpos = np.asarray(data.xpos[bid], dtype=float)
             dists = []
-            for side in arms:
-                bp = _arm_base_world_pos(model, data, side)
-                if bp is not None:
-                    dists.append(f"{side}{np.linalg.norm(gpos - bp):.2f}m")
+            for side, arm in arms.items():
+                bp = _arm_base_world_pos(data, arm)
+                dists.append(f"{side}{np.linalg.norm(gpos - bp):.2f}m")
             print(
                 f"  {name:<22} pos=({gpos[0]:+.3f}, {gpos[1]:+.3f}, {gpos[2]:+.3f})"
                 f"  reach=[{', '.join(dists)}]"

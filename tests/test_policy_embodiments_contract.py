@@ -12,7 +12,6 @@ from examples.scenes import franka_libero_pi
 from mujoco_workbench.arm_handles import (
     ArmHandles,
     ArmSide,
-    RobotKind,
     get_arm_handles,
 )
 from mujoco_workbench.embodiments.droid import (
@@ -165,17 +164,22 @@ def _fake_libero_arm(model: mujoco.MjModel) -> ArmHandles:
     tcp_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left/tcp")
     return ArmHandles(
         side=ArmSide.LEFT,
-        robot_kind=RobotKind.FRANKA_PANDA,
+        name="franka_panda",
+        joint_names=tuple(f"left/joint{i}" for i in range(1, 8)),
+        joint_labels=tuple(f"joint{i}" for i in range(1, 8)),
         qpos_idx=np.zeros(7, dtype=np.int64),
         dof_idx=np.zeros(7, dtype=np.int64),
         jnt_ids=np.zeros(7, dtype=np.int64),
         arm_dof_idx=np.zeros(7, dtype=np.int64),
         act_arm_ids=np.zeros(7, dtype=np.int64),
         act_gripper_id=0,
-        link6_id=0,
+        grasp_body_id=0,
+        base_body_id=0,
         tcp_site_id=tcp_site_id,
+        tcp_site_name="left/tcp",
         gripper_open=255.0,
         gripper_closed=0.0,
+        gripper_puppet_joints=(),
         weld_ids=np.zeros(0, dtype=np.int64),
     )
 

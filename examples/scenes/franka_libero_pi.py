@@ -33,7 +33,7 @@ from mujoco_workbench.arm_handles import (
     ArmHandles,
     ArmSide,
     ManipulatorSpec,
-    RobotKind,
+    franka_panda_manipulator_spec,
     get_arm_handles,
 )
 from mujoco_workbench.cameras import CameraRole
@@ -81,10 +81,7 @@ _RED_CUBE_TARGET = _CubeTargetSpec(
 # Scene-module public attributes (introspected by `runtime.load_scene`).
 # ---------------------------------------------------------------------------
 NAME = "Franka LIBERO (pi05)"
-ROBOT_KIND = RobotKind.FRANKA_PANDA
-MANIPULATORS: tuple[ManipulatorSpec, ...] = (
-    ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.FRANKA_PANDA),
-)
+MANIPULATORS: tuple[ManipulatorSpec, ...] = (franka_panda_manipulator_spec(ArmSide.LEFT),)
 N_CUBES = 1
 GRIPPABLES: tuple[str, ...] = (_RED_CUBE_TARGET.grippable_name,)
 CAMERAS: tuple[tuple[str, CameraRole], ...] = (

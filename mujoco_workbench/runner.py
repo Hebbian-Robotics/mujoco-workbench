@@ -31,7 +31,13 @@ import mujoco
 import numpy as np
 import viser
 
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes, get_arm_handles
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    arm_joint_labels,
+    get_arm_handles,
+    write_gripper_target,
+)
 from mujoco_workbench.cameras import CameraRole, add_frustum_widgets, update_frustum_widgets
 from mujoco_workbench.headless_renderer import NamedCameraRenderer
 from mujoco_workbench.phase_monitor import PhaseContractViolation, PhaseRuntimeMonitor
@@ -49,7 +55,7 @@ from mujoco_workbench.runtime import (
     resolve_timeline_actuator_maps,
     validate_task_plan_targets,
 )
-from mujoco_workbench.scene_base import PhaseContract, Step, TaskPhase
+from mujoco_workbench.scene_base import PhaseContract, Step, TaskPhase, ViserCameraPose
 from mujoco_workbench.scene_check import (
     CameraInvariant,
     check_scene,
@@ -136,6 +142,12 @@ def prewarm_step_free_play(
         return False
     free_play_prewarm(model, data)
     return True
+
+
+def set_client_viser_camera_pose(client: viser.ClientHandle, pose: ViserCameraPose) -> None:
+    """Move one browser client's orbit camera to a scene-declared startup pose."""
+    client.camera.position = pose.position
+    client.camera.look_at = pose.lookat
 
 
 def reset_step_free_play(step_free_play: StepFreePlay | None) -> bool:
@@ -257,6 +269,15 @@ def main(argv: list[str] | None = None) -> None:
             "if >0, log named-camera frames every N render ticks (e.g. 5 → "
             "9 Hz at the default 45 Hz render rate). 0 disables camera "
             "logging — recommended over slow SSH tunnels."
+        ),
+    )
+    parser.add_argument(
+        "--camera-feed-every",
+        type=int,
+        default=3,
+        help=(
+            "refresh in-browser named-camera feed images every N render ticks; "
+            "0 disables camera feeds for smoother live playback"
         ),
     )
     parser.add_argument(
@@ -505,11 +526,11 @@ def main(argv: list[str] | None = None) -> None:
             if bid >= 0:
                 rerun_body_ids[grippable_name] = bid
         for side, arm in arms.items():
-            wrist_id = arm.link6_id
+            wrist_id = arm.grasp_body_id
             if wrist_id >= 0:
                 rerun_body_ids[f"{side.rstrip('/')}/wrist"] = wrist_id
         for side, arm in arms.items():
-            rerun_joint_names[side] = arm_joint_suffixes(arm.robot_kind)
+            rerun_joint_names[side] = arm_joint_labels(arm)
 
     rerun_tick_counter = {"n": 0}
     camera_feed_tick_counter = {"n": 0}
@@ -522,6 +543,13 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     server = viser.ViserServer(host=args.host, port=args.port)
+    default_viser_camera_pose = scene.default_viser_camera_pose
+    if default_viser_camera_pose is not None:
+
+        @server.on_client_connect
+        def _set_default_client_camera(client: viser.ClientHandle) -> None:
+            set_client_viser_camera_pose(client, default_viser_camera_pose)
+
     # `build_viser_scene` reads `data` to bake initial static-geom poses, so
     # `apply_initial_state` must already have run.
     handles, handle_by_geom_id = build_viser_scene(server, model, data)
@@ -586,7 +614,7 @@ def main(argv: list[str] | None = None) -> None:
             scene_name=args.scene,
         )
 
-    control = {"playing": not policy_mode, "reset_requested": False}
+    control = {"playing": False, "reset_requested": False}
 
     if policy_mode:
         assert policy_endpoint is not None
@@ -676,8 +704,8 @@ def main(argv: list[str] | None = None) -> None:
 
     camera_feed_renderer: NamedCameraRenderer | None = None
     camera_feed_handles: dict[str, viser.GuiImageHandle] = {}
-    camera_feed_every = 3
-    if cameras:
+    camera_feed_every = int(args.camera_feed_every)
+    if cameras and camera_feed_every > 0:
         camera_feed_renderer = NamedCameraRenderer(
             model,
             width=scene.camera_feed.render_width,
@@ -769,7 +797,7 @@ def main(argv: list[str] | None = None) -> None:
                     model,
                     data,
                     int(arm.weld_ids[step.weld_activate]),
-                    arm.link6_id,
+                    arm.grasp_body_id,
                     cube_body_ids[step.weld_activate],
                     arm.tcp_site_id,
                 )
@@ -845,21 +873,7 @@ def main(argv: list[str] | None = None) -> None:
 
         tgt_g = arm.gripper_open if step.gripper == "open" else arm.gripper_closed
         curr_g = (1.0 - alpha_s) * st.start_g + alpha_s * tgt_g
-        if (
-            arm.piper_mirrored_gripper_qpos_idx is not None
-            and arm.piper_mirrored_gripper_dof_idx is not None
-        ):
-            # Piper joint7/8 are tendon-coupled finger slides. Puppet-write
-            # both so the tendon equality has nothing to enforce.
-            left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
-            left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
-            data.qpos[left_gripper_qpos_idx] = curr_g
-            data.qpos[right_gripper_qpos_idx] = -curr_g
-            data.qvel[left_gripper_dof_idx] = 0.0
-            data.qvel[right_gripper_dof_idx] = 0.0
-        # UR10e + 2F-85: ctrl drives the tendon equality; the 4-bar linkage
-        # joints settle on their own.
-        data.ctrl[arm.act_gripper_id] = curr_g
+        write_gripper_target(data, arm, curr_g)
 
         # Multiple arms may write the same aux on overlapping steps; last
         # write wins — scenes are expected to keep their targets consistent.
@@ -964,6 +978,7 @@ def main(argv: list[str] | None = None) -> None:
     if task_plan is not None:
         parts = ", ".join(f"{side}={len(task_plan[side])}" for side in arm_sides)
         print(f"Timeline: {parts} steps (run in parallel)")
+        print("Scripted scenes start paused. Press play in the Viser UI to run.")
 
     next_tick = time.perf_counter()
     sim_t = 0.0

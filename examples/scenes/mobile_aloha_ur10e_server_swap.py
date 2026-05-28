@@ -52,7 +52,12 @@ from examples.scenes.mobile_aloha_ur10e_server_swap_layout import (
     LAYOUT,
     PHASE_HOMES,
 )
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    ManipulatorSpec,
+    ur10e_robotiq_manipulator_spec,
+)
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.ik import PositionOnly, solve_ik
 from mujoco_workbench.placement import camera_xyaxes_for_look_at, standoff_position
@@ -83,12 +88,13 @@ from mujoco_workbench.scene_check import (
 from mujoco_workbench.welds import activate_attachment_weld, deactivate_weld
 
 NAME = "mobile_aloha_ur10e_server_swap"
-# `ROBOT_KIND` selects the `arm_handles.get_arm_handles` branch.
-ROBOT_KIND = "ur10e"
 # Planar base joints the IK solver must lock (not optimise). Shared across
 # scene-agnostic IK tools.
 IK_LOCKED_JOINT_NAMES: tuple[str, ...] = ("base_x", "base_y", "base_yaw")
-ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+ARM_SIDES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+MANIPULATORS: tuple[ManipulatorSpec, ...] = tuple(
+    ur10e_robotiq_manipulator_spec(side) for side in ARM_SIDES
+)
 # Grippable objects addressable via Step.weld_activate / weld_deactivate.
 # Index order is load-bearing: the runner uses it as an int index.
 GRIPPABLES: tuple[str, ...] = ("server", "new_server")
@@ -277,9 +283,9 @@ _QACC_SENTINEL = QaccSentinel(max_increase=0)
 
 # Joints that must stay frozen for an arm-only or base-only phase. Each phase
 # attaches the appropriate `JointSetStatic` invariant(s). Arm names come from
-# the same `arm_joint_suffixes` source the runner + teleop use.
+# the explicit manipulator specs the runner + teleop use.
 _ARM_JOINT_NAMES: tuple[str, ...] = tuple(
-    f"{side.value}{suffix}" for side in ARM_PREFIXES for suffix in arm_joint_suffixes(ROBOT_KIND)
+    joint_name for manipulator in MANIPULATORS for joint_name in manipulator.joint_names
 )
 _ARMS_STATIC = JointSetStatic(joint_names=_ARM_JOINT_NAMES, label="arms")
 _BASE_STATIC = JointSetStatic(joint_names=IK_LOCKED_JOINT_NAMES, label="base")
@@ -288,7 +294,7 @@ _BASE_STATIC = JointSetStatic(joint_names=IK_LOCKED_JOINT_NAMES, label="base")
 # closed value (255). Catches the realistic "gripper toggled mid-carry → load
 # drops" failure mode that QACC alone wouldn't flag.
 _GRIPPER_ACTUATOR_NAMES: tuple[str, ...] = tuple(
-    f"{side.value}gripper/fingers_actuator" for side in ARM_PREFIXES
+    manipulator.gripper.actuator_name for manipulator in MANIPULATORS
 )
 _GRIPPERS_CLOSED = GripperStateHold(
     actuator_names=_GRIPPER_ACTUATOR_NAMES,
@@ -998,7 +1004,7 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
         ArmSide.LEFT: LEFT_ARM_MOUNT_SITE,
         ArmSide.RIGHT: RIGHT_ARM_MOUNT_SITE,
     }
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         ur10e_root = load_ur10e_with_gripper(side)
         wrist3 = ur10e_root.find("body", "wrist_3_link")
         if wrist3 is None:
@@ -1158,7 +1164,7 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # resolves them via the same `<side>_grasp_cube<i>` formula. Both arms
     # register a weld onto each grippable so the bimanual sync grip can
     # activate the L+R pair on the same step.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         hand = f"{side}wrist_3_link"
         side_us = side.replace("/", "_")
         for i, obj_name in enumerate(GRIPPABLES):
@@ -1440,7 +1446,7 @@ def make_task_plan(
     Phase mapping: SETUP, REMOVE/STOW/RETRIEVE/INSTALL_*_SERVER (Actions
     A-D), RESET.
     """
-    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_PREFIXES}
+    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_SIDES}
 
     def push_both(
         label: str,
@@ -1453,7 +1459,7 @@ def make_task_plan(
 
         Home pose is per-side (mirrored arms) — each side gets its own arm_q.
         """
-        for side in ARM_PREFIXES:
+        for side in ARM_SIDES:
             scripts[side].append(
                 Step(
                     label=label,
@@ -1507,8 +1513,8 @@ def make_task_plan(
     # made the cart/rack transfer paths clip badly when the IK solutions drifted.
     server_id = grippable_id("server")
     new_server_id = grippable_id("new_server")
-    server_grasp = {side: grasp_weld(side, server_id) for side in ARM_PREFIXES}
-    new_grasp = {side: grasp_weld(side, new_server_id) for side in ARM_PREFIXES}
+    server_grasp = {side: grasp_weld(side, server_id) for side in ARM_SIDES}
+    new_grasp = {side: grasp_weld(side, new_server_id) for side in ARM_SIDES}
 
     # === SETUP ============================================================
     push_both("home", 1.0, TaskPhase.SETUP, base=base_at_rack)
@@ -1519,7 +1525,7 @@ def make_task_plan(
     # the next phase (BACKUP_FROM_RACK).
     snap_l, snap_r = seed_at_base()
     handle_in_rack: dict[ArmSide, Position3] = {
-        side: LAYOUT.handle_world_pos_in_rack(side) for side in ARM_PREFIXES
+        side: LAYOUT.handle_world_pos_in_rack(side) for side in ARM_SIDES
     }
     # Approach/retract points are derived from the handle surface point and
     # world +X approach direction: the TCP starts in front of the bezel, touches
@@ -1530,7 +1536,7 @@ def make_task_plan(
             np.array([1.0, 0.0, 0.0]),
             distance_m=RACK_HANDLE_APPROACH_M,
         )
-        for side in ARM_PREFIXES
+        for side in ARM_SIDES
     }
     pull_clear = {
         side: standoff_position(
@@ -1538,14 +1544,14 @@ def make_task_plan(
             np.array([1.0, 0.0, 0.0]),
             distance_m=RACK_HANDLE_PULL_CLEAR_M,
         )
-        for side in ARM_PREFIXES
+        for side in ARM_SIDES
     }
     snap_by_side = {ArmSide.LEFT: snap_l, ArmSide.RIGHT: snap_r}
-    q_approach_a = {side: snap_by_side[side](approach_in_rack[side])[0] for side in ARM_PREFIXES}
-    q_at_handle_a = {side: snap_by_side[side](handle_in_rack[side])[0] for side in ARM_PREFIXES}
-    q_pull_clear = {side: snap_by_side[side](pull_clear[side])[0] for side in ARM_PREFIXES}
+    q_approach_a = {side: snap_by_side[side](approach_in_rack[side])[0] for side in ARM_SIDES}
+    q_at_handle_a = {side: snap_by_side[side](handle_in_rack[side])[0] for side in ARM_SIDES}
+    q_pull_clear = {side: snap_by_side[side](pull_clear[side])[0] for side in ARM_SIDES}
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"approach handle {side.rstrip('_/')}",
@@ -1556,7 +1562,7 @@ def make_task_plan(
                 base_target=base_at_rack,
             )
         )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"at handle {side.rstrip('_/')}",
@@ -1592,7 +1598,7 @@ def make_task_plan(
             base_target=base_at_rack,
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"pull clear of rails {side.rstrip('_/')}",
@@ -1608,7 +1614,7 @@ def make_task_plan(
     # Arms hold q_pull_clear so the welded server rides backward with the
     # chassis. No re-IK at the new base pose — that's the whole point of the
     # split: a base-only phase keeps the arm joints fixed.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"backup from rack {side.rstrip('_/')}",
@@ -1622,7 +1628,7 @@ def make_task_plan(
 
     # === TRAVERSE_TO_CART (base-only) =====================================
     # Same arm config; chassis rotates + translates to face the cart.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"traverse to cart {side.rstrip('_/')}",
@@ -1640,28 +1646,26 @@ def make_task_plan(
     )
     snap_cart = {ArmSide.LEFT: snap_l_cart, ArmSide.RIGHT: snap_r_cart}
     # 5 cm above rest pose so the final descent is a clean vertical settle.
-    place_bottom = {side: LAYOUT.handle_world_pos_on_cart_bottom(side) for side in ARM_PREFIXES}
+    place_bottom = {side: LAYOUT.handle_world_pos_on_cart_bottom(side) for side in ARM_SIDES}
     approach_bottom = {
         side: standoff_position(
             place_bottom[side],
             np.array([0.0, 0.0, -1.0]),
             distance_m=CART_HANDLE_LIFT_CLEARANCE_M,
         )
-        for side in ARM_PREFIXES
+        for side in ARM_SIDES
     }
     # Retract: 10 cm up + 10 cm back. "Back from cart" is -Y in world coords.
-    retract_bottom = {
-        side: place_bottom[side] + np.array([0.0, -0.10, 0.10]) for side in ARM_PREFIXES
-    }
-    q_above_bottom = {side: snap_cart[side](approach_bottom[side])[0] for side in ARM_PREFIXES}
-    q_on_bottom = {side: snap_cart[side](place_bottom[side])[0] for side in ARM_PREFIXES}
-    q_retract_bottom = {side: snap_cart[side](retract_bottom[side])[0] for side in ARM_PREFIXES}
+    retract_bottom = {side: place_bottom[side] + np.array([0.0, -0.10, 0.10]) for side in ARM_SIDES}
+    q_above_bottom = {side: snap_cart[side](approach_bottom[side])[0] for side in ARM_SIDES}
+    q_on_bottom = {side: snap_cart[side](place_bottom[side])[0] for side in ARM_SIDES}
+    q_retract_bottom = {side: snap_cart[side](retract_bottom[side])[0] for side in ARM_SIDES}
     q_cart_safe = {
         ArmSide.LEFT: q_retract_bottom[ArmSide.LEFT],
         ArmSide.RIGHT: HOME_ARM_Q_BY_SIDE[ArmSide.RIGHT].copy(),
     }
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         if side is ArmSide.LEFT:
             scripts[side].append(
                 Step(
@@ -1699,7 +1703,7 @@ def make_task_plan(
     # Soft descent: 1.4 s for the last 5 cm. NEW_LAYOUT.md says "halve
     # descent velocity at 2 cm above tray" — approximated by slower
     # interpolation for the whole step.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"settle on tray {side.rstrip('_/')}",
@@ -1733,7 +1737,7 @@ def make_task_plan(
             base_target=base_at_cart,
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"retract from tray {side.rstrip('_/')}",
@@ -1746,23 +1750,23 @@ def make_task_plan(
         )
 
     # === RETRIEVE_NEW_SERVER (arm-only at base = cart) ====================
-    grasp_top = {side: LAYOUT.handle_world_pos_on_cart_top(side) for side in ARM_PREFIXES}
+    grasp_top = {side: LAYOUT.handle_world_pos_on_cart_top(side) for side in ARM_SIDES}
     approach_top = {
         side: standoff_position(
             grasp_top[side],
             np.array([0.0, 1.0, 0.0]),
             distance_m=CART_HANDLE_APPROACH_M,
         )
-        for side in ARM_PREFIXES
+        for side in ARM_SIDES
     }
-    lift_top = {side: grasp_top[side] + np.array([0.0, 0.0, 0.03]) for side in ARM_PREFIXES}
+    lift_top = {side: grasp_top[side] + np.array([0.0, 0.0, 0.03]) for side in ARM_SIDES}
 
-    q_above_top = {side: snap_cart[side](approach_top[side])[0] for side in ARM_PREFIXES}
-    q_at_top = {side: snap_cart[side](grasp_top[side])[0] for side in ARM_PREFIXES}
-    q_lift_top = {side: snap_cart[side](lift_top[side])[0] for side in ARM_PREFIXES}
+    q_above_top = {side: snap_cart[side](approach_top[side])[0] for side in ARM_SIDES}
+    q_at_top = {side: snap_cart[side](grasp_top[side])[0] for side in ARM_SIDES}
+    q_lift_top = {side: snap_cart[side](lift_top[side])[0] for side in ARM_SIDES}
     q_lift_top[ArmSide.RIGHT] = q_cart_safe[ArmSide.RIGHT]
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"approach top shelf {side.rstrip('_/')}",
@@ -1773,7 +1777,7 @@ def make_task_plan(
                 base_target=base_at_cart,
             )
         )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"at top handle {side.rstrip('_/')}",
@@ -1806,7 +1810,7 @@ def make_task_plan(
             base_target=base_at_cart,
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"lift clear {side.rstrip('_/')}",
@@ -1822,7 +1826,7 @@ def make_task_plan(
     # Pin the replacement in the rack before the long base traverse. Keeping it
     # gripper-welded during the cart→rack move sweeps the chassis through the
     # rack side panels in this simplified puppet-mode scene.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         if side is ArmSide.LEFT:
             scripts[side].append(
                 Step(
@@ -1861,7 +1865,7 @@ def make_task_plan(
     # === ADVANCE_INTO_RACK (base-only) ====================================
     # Arms still hold q_lift_top; chassis steps forward 0.10 m so the held
     # server tracks straight at the rack opening before INSTALL extends.
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"advance into rack {side.rstrip('_/')}",
@@ -1878,15 +1882,15 @@ def make_task_plan(
     # carry pose into the rack slot (~7 cm forward, ~7.5 cm up). Pin + release.
     snap_l_inserted, snap_r_inserted = seed_at_base(base_x=BASE_AT_INSERT)
     snap_inserted = {ArmSide.LEFT: snap_l_inserted, ArmSide.RIGHT: snap_r_inserted}
-    insert_handle = {side: LAYOUT.handle_world_pos_in_rack(side) for side in ARM_PREFIXES}
-    q_inserted = {side: snap_inserted[side](insert_handle[side])[0] for side in ARM_PREFIXES}
+    insert_handle = {side: LAYOUT.handle_world_pos_in_rack(side) for side in ARM_SIDES}
+    q_inserted = {side: snap_inserted[side](insert_handle[side])[0] for side in ARM_SIDES}
     # Withdraw 7 cm back; base still at insert offset; server stays welded.
     withdraw_handle = {
-        side: insert_handle[side] + np.array([-0.07, 0.0, 0.0]) for side in ARM_PREFIXES
+        side: insert_handle[side] + np.array([-0.07, 0.0, 0.0]) for side in ARM_SIDES
     }
-    q_withdraw = {side: snap_inserted[side](withdraw_handle[side])[0] for side in ARM_PREFIXES}
+    q_withdraw = {side: snap_inserted[side](withdraw_handle[side])[0] for side in ARM_SIDES}
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"push into rack {side.rstrip('_/')}",
@@ -1917,7 +1921,7 @@ def make_task_plan(
             base_target=base_at_insert,
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"withdraw from rack {side.rstrip('_/')}",
@@ -1972,7 +1976,7 @@ def make_task_plan(
             base_target=base_at_insert,
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 f"base to origin {side.rstrip('_/')}",
@@ -1984,7 +1988,7 @@ def make_task_plan(
             )
         )
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         print(f"  [{side}] {len(scripts[side])} steps planned")
 
     apply_initial_state(model, data, arms, cube_body_ids)

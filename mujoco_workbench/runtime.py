@@ -13,7 +13,7 @@ import inspect
 import math
 import os
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -36,10 +36,8 @@ from mujoco_workbench.arm_handles import (  # noqa: E402
     ArmHandles,
     ArmSide,
     ManipulatorSpec,
-    RobotKind,
     get_arm_handles,
-    manipulator_specs_from_legacy_arm_sides,
-    parse_robot_kind,
+    write_gripper_target,
 )
 from mujoco_workbench.cameras import CameraRole  # noqa: E402
 from mujoco_workbench.policy_types import PolicyEndpoint, PolicyPrompt  # noqa: E402
@@ -48,6 +46,7 @@ from mujoco_workbench.scene_base import (  # noqa: E402
     PhaseContract,
     Step,
     TaskPhase,
+    ViserCameraPose,
 )
 from mujoco_workbench.scene_check import AttachmentConstraint, CameraInvariant  # noqa: E402
 from mujoco_workbench.welds import (  # noqa: E402
@@ -142,7 +141,6 @@ class LoadedScene:
     manipulators: tuple[ManipulatorSpec, ...]
     arm_sides: tuple[ArmSide, ...]
     n_cubes: int
-    robot_kind: RobotKind
     mobile_base: MobileBaseSpec | None
     lift: LiftSpec | None
     grippable_names: tuple[str, ...]
@@ -153,6 +151,7 @@ class LoadedScene:
     phase_contracts: tuple[PhaseContract, ...]
     cameras: tuple[tuple[str, CameraRole], ...]
     camera_feed: CameraFeedSpec
+    default_viser_camera_pose: ViserCameraPose | None
     ik_locked_joint_names: tuple[str, ...]
     ik_seed_q: np.ndarray | None
 
@@ -205,73 +204,24 @@ def _tuple_attr(module: ModuleType, attr_name: str) -> tuple[Any, ...]:
     return tuple(value)
 
 
-def _parse_scene_robot_kind(raw_robot_kind: object, scene_name: SceneName) -> RobotKind:
-    try:
-        return parse_robot_kind(raw_robot_kind)
-    except ValueError as err:
-        raise ValueError(
-            f"scene {scene_name!r} has unsupported ROBOT_KIND={raw_robot_kind!r}"
-        ) from err
-
-
-def _parse_arm_sides(raw_arm_sides: tuple[Any, ...], scene_name: SceneName) -> tuple[ArmSide, ...]:
-    try:
-        return tuple(ArmSide(raw_arm_side) for raw_arm_side in raw_arm_sides)
-    except ValueError as err:
-        valid = ", ".join(side.value for side in ArmSide)
-        raise ValueError(
-            f"scene {scene_name!r} has unsupported ARM_PREFIXES entry; expected one of: {valid}"
-        ) from err
-
-
-def _parse_manipulator_side(raw_side: object, scene_name: SceneName) -> ArmSide:
-    try:
-        return ArmSide(str(raw_side))
-    except ValueError as err:
-        valid = ", ".join(side.value for side in ArmSide)
-        raise ValueError(
-            f"scene {scene_name!r} has unsupported manipulator side {raw_side!r}; "
-            f"expected one of: {valid}"
-        ) from err
-
-
-def _parse_manipulator_spec(
-    raw_manipulator: object,
-    scene_name: SceneName,
-    default_robot_kind: RobotKind,
-) -> ManipulatorSpec:
-    if isinstance(raw_manipulator, ManipulatorSpec):
-        return raw_manipulator
-    if isinstance(raw_manipulator, ArmSide):
-        return ManipulatorSpec(side=raw_manipulator, robot_kind=default_robot_kind)
-    if isinstance(raw_manipulator, Mapping):
-        raw_manipulator_mapping = cast(Mapping[str, object], raw_manipulator)
-        raw_side = raw_manipulator_mapping.get("side")
-        raw_robot_kind = raw_manipulator_mapping.get("robot_kind", default_robot_kind)
-        return ManipulatorSpec(
-            side=_parse_manipulator_side(raw_side, scene_name),
-            robot_kind=_parse_scene_robot_kind(raw_robot_kind, scene_name),
-        )
-    raise ValueError(
-        f"scene {scene_name!r} has unsupported MANIPULATORS entry {raw_manipulator!r}; "
-        "expected ManipulatorSpec or {'side': ..., 'robot_kind': ...}"
-    )
-
-
 def _parse_manipulators(
     module: ModuleType,
     scene_name: SceneName,
-    default_robot_kind: RobotKind,
 ) -> tuple[ManipulatorSpec, ...]:
     raw_manipulators = _tuple_attr(module, "MANIPULATORS")
-    if raw_manipulators:
-        manipulators = tuple(
-            _parse_manipulator_spec(raw_manipulator, scene_name, default_robot_kind)
-            for raw_manipulator in raw_manipulators
+    if not raw_manipulators:
+        raise ValueError(
+            f"scene {scene_name!r} must declare MANIPULATORS with one or two "
+            "explicit ManipulatorSpec instances"
         )
-    else:
-        arm_sides = _parse_arm_sides(_tuple_attr(module, "ARM_PREFIXES"), scene_name)
-        manipulators = manipulator_specs_from_legacy_arm_sides(arm_sides, default_robot_kind)
+    if not all(
+        isinstance(raw_manipulator, ManipulatorSpec) for raw_manipulator in raw_manipulators
+    ):
+        raise ValueError(
+            f"scene {scene_name!r} has unsupported MANIPULATORS entry; "
+            "expected explicit ManipulatorSpec instances"
+        )
+    manipulators = cast(tuple[ManipulatorSpec, ...], raw_manipulators)
 
     if len(manipulators) > 2:
         raise ValueError(
@@ -382,7 +332,7 @@ def validate_task_plan_targets(
                 raise ValueError(
                     f"scene {scene.module_name!r} step {step.label!r} for {side.value} "
                     f"has arm_q shape {step.arm_q.shape}; expected ({expected_joint_count},) "
-                    f"for {arms[side].robot_kind.value}"
+                    f"for {arms[side].name}"
                 )
             if step.base_target is not None and scene.mobile_base is None:
                 raise ValueError(
@@ -422,8 +372,7 @@ def load_scene(name: SceneName | str) -> LoadedScene:
     )
     step_free_play = _optional_callable(module, "step_free_play")
     supports_start_phase = "start_phase" in inspect.signature(apply_initial_state).parameters
-    robot_kind = _parse_scene_robot_kind(getattr(module, "ROBOT_KIND", RobotKind.PIPER), scene_name)
-    manipulators = _parse_manipulators(module, scene_name, robot_kind)
+    manipulators = _parse_manipulators(module, scene_name)
     aux_actuator_names = tuple(str(name) for name in _tuple_attr(module, "AUX_ACTUATOR_NAMES"))
     mobile_base = _parse_mobile_base(module, scene_name=scene_name)
     lift = _parse_lift(module, scene_name=scene_name)
@@ -446,7 +395,6 @@ def load_scene(name: SceneName | str) -> LoadedScene:
         manipulators=manipulators,
         arm_sides=tuple(manipulator.side for manipulator in manipulators),
         n_cubes=int(getattr(module, "N_CUBES", 0)),
-        robot_kind=robot_kind,
         mobile_base=mobile_base,
         lift=lift,
         grippable_names=tuple(str(name) for name in _tuple_attr(module, "GRIPPABLES")),
@@ -457,11 +405,69 @@ def load_scene(name: SceneName | str) -> LoadedScene:
         phase_contracts=tuple(_tuple_attr(module, "PHASE_CONTRACTS")),
         cameras=tuple(_tuple_attr(module, "CAMERAS")),
         camera_feed=_parse_camera_feed(module, scene_name=scene_name),
+        default_viser_camera_pose=_parse_default_viser_camera_pose(module, scene_name=scene_name),
         ik_locked_joint_names=tuple(
             str(name) for name in _tuple_attr(module, "IK_LOCKED_JOINT_NAMES")
         ),
         ik_seed_q=(
             np.asarray(module.IK_SEED_Q, dtype=float) if hasattr(module, "IK_SEED_Q") else None
+        ),
+    )
+
+
+def _parse_world_point_value(
+    raw_value: object, *, scene_name: SceneName, field_name: str
+) -> WorldPoint:
+    if not isinstance(raw_value, Sequence) or isinstance(raw_value, str):
+        raise ValueError(
+            f"scene {scene_name!r} {field_name} must be a 3-number iterable, got {raw_value!r}"
+        )
+    if len(raw_value) != 3:
+        raise ValueError(
+            f"scene {scene_name!r} {field_name} must have exactly 3 values, got {raw_value!r}"
+        )
+    try:
+        return (
+            float(cast(Any, raw_value[0])),
+            float(cast(Any, raw_value[1])),
+            float(cast(Any, raw_value[2])),
+        )
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"scene {scene_name!r} {field_name} values must be numeric, got {raw_value!r}"
+        ) from err
+
+
+def _parse_default_viser_camera_pose(
+    module: ModuleType, *, scene_name: SceneName
+) -> ViserCameraPose | None:
+    raw_pose = getattr(module, "DEFAULT_VISER_CAMERA_POSE", None)
+    if raw_pose is None:
+        return None
+    if isinstance(raw_pose, ViserCameraPose):
+        return raw_pose
+    if not isinstance(raw_pose, Mapping):
+        raise ValueError(
+            f"scene {scene_name!r} DEFAULT_VISER_CAMERA_POSE must be a "
+            "ViserCameraPose or dict with 'position' and 'lookat'"
+        )
+    try:
+        raw_position = raw_pose["position"]
+        raw_lookat = raw_pose["lookat"]
+    except KeyError as err:
+        raise ValueError(
+            f"scene {scene_name!r} DEFAULT_VISER_CAMERA_POSE missing {err.args[0]!r}"
+        ) from err
+    return ViserCameraPose(
+        position=_parse_world_point_value(
+            raw_position,
+            scene_name=scene_name,
+            field_name="DEFAULT_VISER_CAMERA_POSE.position",
+        ),
+        lookat=_parse_world_point_value(
+            raw_lookat,
+            scene_name=scene_name,
+            field_name="DEFAULT_VISER_CAMERA_POSE.lookat",
         ),
     )
 
@@ -751,7 +757,7 @@ def _advance_one_arm(
                 model,
                 data,
                 int(arm.weld_ids[step.weld_activate]),
-                arm.link6_id,
+                arm.grasp_body_id,
                 cube_body_ids[step.weld_activate],
                 arm.tcp_site_id,
             )
@@ -808,18 +814,7 @@ def _advance_one_arm(
 
     target_gripper = arm.gripper_open if step.gripper == "open" else arm.gripper_closed
     curr_g = (1.0 - alpha_s) * st.start_g + alpha_s * target_gripper
-    if (
-        arm.piper_mirrored_gripper_qpos_idx is not None
-        and arm.piper_mirrored_gripper_dof_idx is not None
-    ):
-        left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
-        left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
-        data.qpos[left_gripper_qpos_idx] = curr_g
-        data.qpos[right_gripper_qpos_idx] = -curr_g
-        data.qvel[left_gripper_dof_idx] = 0.0
-        data.qvel[right_gripper_dof_idx] = 0.0
-    # UR10e + 2F-85: actuator drives the tendon equality; finger joints settle.
-    data.ctrl[arm.act_gripper_id] = curr_g
+    write_gripper_target(data, arm, curr_g)
 
     if step.base_target is not None:
         if not base_name_to_id:

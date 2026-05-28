@@ -41,7 +41,13 @@ from examples.scenes.mobile_aloha_piper_indicator_check_layout import (
     HOME_ARM_Q_BY_SIDE,
     LAYOUT,
 )
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, arm_joint_suffixes
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    ManipulatorSpec,
+    piper_manipulator_spec,
+    write_gripper_target,
+)
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.scene_base import (
     GripperState,
@@ -53,6 +59,7 @@ from mujoco_workbench.scene_base import (
     QuatWxyz,
     Step,
     TaskPhase,
+    ViserCameraPose,
 )
 from mujoco_workbench.scene_check import (
     AttachmentConstraint,
@@ -61,9 +68,15 @@ from mujoco_workbench.scene_check import (
 )
 
 NAME = "mobile_aloha_piper_indicator_check"
-ROBOT_KIND = "piper"
+DEFAULT_VISER_CAMERA_POSE = ViserCameraPose(
+    position=(0.274, -1.800, 1.795),
+    lookat=(1.477, -0.625, 0.977),
+)
 IK_LOCKED_JOINT_NAMES: tuple[str, ...] = ("base_x", "base_y", "base_yaw")
-ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+ARM_SIDES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+MANIPULATORS: tuple[ManipulatorSpec, ...] = tuple(
+    piper_manipulator_spec(side) for side in ARM_SIDES
+)
 GRIPPABLES: tuple[str, ...] = ()
 N_CUBES = 0
 ATTACHMENTS: tuple[AttachmentConstraint, ...] = ()
@@ -165,7 +178,7 @@ _ALERT_SERVER_TOUCH_GEOM_NAMES: tuple[str, ...] = (
 )
 _FINGERTIP_BODY_NAMES: tuple[str, ...] = tuple(
     f"{side.value}{finger_body_name}"
-    for side in ARM_PREFIXES
+    for side in ARM_SIDES
     for finger_body_name in ("link7", "link8")
 )
 
@@ -262,7 +275,7 @@ EGL render."""
 
 _QACC_SENTINEL = QaccSentinel(max_increase=0)
 _ARM_JOINT_NAMES: tuple[str, ...] = tuple(
-    f"{side.value}{suffix}" for side in ARM_PREFIXES for suffix in arm_joint_suffixes(ROBOT_KIND)
+    joint_name for manipulator in MANIPULATORS for joint_name in manipulator.joint_names
 )
 _ARMS_STATIC = JointSetStatic(joint_names=_ARM_JOINT_NAMES, label="arms")
 _BASE_STATIC = JointSetStatic(joint_names=IK_LOCKED_JOINT_NAMES, label="base")
@@ -614,7 +627,7 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
             _axis_angle_quat(RotationAxis.X, math.radians(_WRIST_CAM_TILT_TOWARD_GRIPPER_DEG)),
         )
     )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         piper = load_piper(side)
         link6 = piper.find("body", "link6")
         if link6 is None:
@@ -836,19 +849,7 @@ def apply_initial_state(
         data.ctrl[arm.act_arm_ids] = home_q
         # Piper gripper open at home — no payload, so visual default of
         # open jaws reads as "ready to interact".
-        data.ctrl[arm.act_gripper_id] = arm.gripper_open
-        # Mirror the gripper open value into the tendon-coupled finger
-        # slides (Piper has two finger qpos that mirror each other).
-        if (
-            arm.piper_mirrored_gripper_qpos_idx is not None
-            and arm.piper_mirrored_gripper_dof_idx is not None
-        ):
-            left_gripper_qpos_idx, right_gripper_qpos_idx = arm.piper_mirrored_gripper_qpos_idx
-            left_gripper_dof_idx, right_gripper_dof_idx = arm.piper_mirrored_gripper_dof_idx
-            data.qpos[left_gripper_qpos_idx] = arm.gripper_open
-            data.qpos[right_gripper_qpos_idx] = -arm.gripper_open
-            data.qvel[left_gripper_dof_idx] = 0.0
-            data.qvel[right_gripper_dof_idx] = 0.0
+        write_gripper_target(data, arm, arm.gripper_open)
     for jname, value in zip(
         (
             IndicatorBaseActuator.BASE_X,
@@ -881,7 +882,7 @@ def make_task_plan(
 ) -> dict[ArmSide, list[Step]]:
     """Scripted indicator-check choreography: drive in → align → reach →
     wait + flip → retract."""
-    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_PREFIXES}
+    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_SIDES}
 
     def push_both(
         label: str,
@@ -892,7 +893,7 @@ def make_task_plan(
         gripper: GripperState = "open",
         set_geom_rgba: tuple[tuple[str, tuple[float, float, float, float]], ...] = (),
     ) -> None:
-        for side in ARM_PREFIXES:
+        for side in ARM_SIDES:
             scripts[side].append(
                 Step(
                     label=label,
@@ -914,7 +915,7 @@ def make_task_plan(
         *,
         gripper: GripperState = "open",
     ) -> None:
-        for side in ARM_PREFIXES:
+        for side in ARM_SIDES:
             scripts[side].append(
                 Step(
                     label=f"{label} {side.rstrip('_/')}",
@@ -1037,7 +1038,7 @@ def make_task_plan(
                 base_target=base_click,
             )
         )
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         scripts[side].append(
             Step(
                 label=f"flip indicator {side.rstrip('_/')}",
@@ -1069,7 +1070,7 @@ def make_task_plan(
         base=base_click,
     )
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         print(f"  [{side}] {len(scripts[side])} steps planned")
 
     apply_initial_state(model, data, arms, cube_body_ids)

@@ -20,7 +20,6 @@ the module is cheap to import and unit-testable without a model in hand.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -101,21 +100,6 @@ class _Cart:
     post_half: float = 0.020  # 4 cm x 4 cm corner posts
     caster_radius: float = 0.035
     handle_height: float = 0.95  # top of the push handle (above top shelf)
-
-
-@dataclass(frozen=True)
-class _Bins:
-    """Legacy on-torso bins — kept for backward-compat default values
-    used by `new_server_initial_world_pos`. The data-center scene no
-    longer renders bins; the new server starts on the cart's top shelf
-    instead. Remove once `new_server_initial_world_pos` is retired.
-    """
-
-    half: Half3 = (0.24, 0.28, 0.08)
-    local_x: float = 0.16
-    new_local_z: float = 0.13
-    old_local_z: float = -0.28
-    wall_thickness: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -286,7 +270,6 @@ class DataCenterLayout:
 
     tiago: _Tiago = field(default_factory=_Tiago)
     arm_mount: _ArmMount = field(default_factory=_ArmMount)
-    bins: _Bins = field(default_factory=_Bins)
     cart: _Cart = field(default_factory=_Cart)
     rack: _Rack = field(default_factory=_Rack)
     server: _Server = field(default_factory=_Server)
@@ -467,5 +450,3 @@ LAYOUT = DataCenterLayout()
 
 HOME_ARM_Q = LAYOUT.arm.home_q
 IK_SEED_Q = LAYOUT.arm.ik_seed_q
-
-_PORT_WORLD_POS: Callable[[int], Position3] = LAYOUT.port_world_pos

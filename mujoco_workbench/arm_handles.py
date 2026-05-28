@@ -1,27 +1,13 @@
-"""Per-arm handle resolution, dispatched by robot kind.
+"""Explicit manipulator handle resolution.
 
-`get_arm_handles(model, manipulator, n_cubes)` returns an `ArmHandles`
-carrying the qpos/dof/actuator/body indices the runner + IK code use to
-drive one prefixed arm. Robot-specific naming lives in `ROBOT_ADAPTERS`.
-Supported robot families:
-
-* `"piper"` — AgileX Piper 6-DoF arm + parallel-jaw with two
-  tendon-coupled finger slide joints. `qpos_idx` / `dof_idx` are
-  length-8 (joints 1..8).
-* `"ur10e"` — Universal Robots UR10e + Robotiq 2F-85. The 2F-85's
-  4-bar linkage is tendon-driven by a single `fingers_actuator`
-  (ctrl 0..255); finger qpos is NOT puppet-written — the actuator
-  pushes the tendon equality and the linkage settles.
-  `qpos_idx` / `dof_idx` are length-6 (no finger entries).
-* `"franka_panda"` — stock Menagerie Franka Panda arm + hand.
-* `"franka_panda_robotiq_2f85"` — DROID-shaped Franka Panda arm with a
-  Robotiq 2F-85 on the flange. The arm still has 7 controlled joints;
-  the gripper follows the same actuator convention as UR10e+2F-85.
+Scene modules declare each manipulator with compiled MJCF element names. The
+runtime treats `ArmSide` as a logical key for task plans and UI grouping only;
+it does not derive MuJoCo names from the side.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -29,335 +15,375 @@ import mujoco
 import numpy as np
 
 
-class RobotKind(StrEnum):
-    """Supported mobile-manipulator arm families.
-
-    Keep this set finite: the workbench is intentionally scoped to one or two
-    robot arms on optional mobile bases. New arms should enter through a
-    `RobotAdapter` registration instead of ad-hoc name checks in runtime code.
-    """
-
-    PIPER = "piper"
-    UR10E = "ur10e"
-    FRANKA_PANDA = "franka_panda"
-    FRANKA_PANDA_ROBOTIQ_2F85 = "franka_panda_robotiq_2f85"
-
-
 class ArmSide(StrEnum):
-    """Bimanual arm identity; value is the MuJoCo body-name prefix.
-
-    The trailing `/` is dm_control.mjcf's namespace separator: when a
-    sub-MJCF (Piper or UR10e) is attached with `model="left"`, every
-    body/joint/actuator inside it is renamed `left/<original>`.
-    f-string concatenation (`f"{side}link6"` /
-    `f"{side}wrist_3_link"`) naturally produces the slash-namespaced
-    compiled name.
-    """
+    """Logical manipulator identity used by task plans and controls."""
 
     LEFT = "left/"
     RIGHT = "right/"
 
+    @property
+    def label(self) -> str:
+        return self.value.rstrip("/")
+
 
 @dataclass(frozen=True)
-class RobotAdapter:
-    """Names and control conventions for one supported robot-arm family."""
+class GripperPuppetJoint:
+    """Joint qpos to mirror when a gripper target changes."""
 
-    robot_kind: RobotKind
-    joint_suffixes: tuple[str, ...]
-    controlled_arm_joint_count: int
-    arm_actuator_suffixes: tuple[str, ...]
-    gripper_actuator_suffix: str
-    wrist_body_suffix: str
-    tcp_site_suffix: str
-    piper_mirrored_gripper_joint_suffixes: tuple[str, str] | None = None
+    joint_name: str
+    scale: float = 1.0
+    offset: float = 0.0
 
-    @property
-    def arm_joint_suffixes(self) -> tuple[str, ...]:
-        return self.joint_suffixes[: self.controlled_arm_joint_count]
+
+@dataclass(frozen=True)
+class GripperControlSpec:
+    """Declarative gripper control convention for one manipulator."""
+
+    actuator_name: str
+    open_ctrl: float
+    closed_ctrl: float
+    puppet_joints: tuple[GripperPuppetJoint, ...] = ()
 
 
 @dataclass(frozen=True)
 class ManipulatorSpec:
-    """Parsed manipulator declaration for a scene.
-
-    `side` is still restricted to left/right for now, but `robot_kind` is no
-    longer scene-global. That lets a supported unimanual or asymmetric bimanual
-    scene declare the actual robot family per manipulator.
-    """
+    """Explicit compiled names for one manipulator."""
 
     side: ArmSide
-    robot_kind: RobotKind
+    name: str
+    joint_names: tuple[str, ...]
+    arm_actuator_names: tuple[str, ...]
+    gripper: GripperControlSpec
+    wrist_body_name: str
+    tcp_site_name: str
+    base_body_name: str
+    joint_labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.joint_names) != len(self.arm_actuator_names):
+            raise ValueError(
+                f"manipulator {self.name!r} has {len(self.joint_names)} joints "
+                f"but {len(self.arm_actuator_names)} arm actuators"
+            )
+        if self.joint_labels and len(self.joint_labels) != len(self.joint_names):
+            raise ValueError(
+                f"manipulator {self.name!r} has {len(self.joint_labels)} joint labels "
+                f"but {len(self.joint_names)} joints"
+            )
 
     @property
-    def prefix(self) -> str:
-        return self.side.value
+    def resolved_joint_labels(self) -> tuple[str, ...]:
+        return self.joint_labels or self.joint_names
 
 
-_PIPER_ARM_JOINT_SUFFIXES: tuple[str, ...] = tuple(f"joint{i}" for i in range(1, 9))
-"""Piper joints 1..8 — first 6 are arm DoFs, last 2 are tendon-coupled
-finger slides."""
+@dataclass(frozen=True)
+class GripperPuppetJointHandle:
+    """Resolved qpos/dof target for a gripper puppet joint."""
 
-_UR10E_ARM_JOINT_SUFFIXES: tuple[str, ...] = (
-    "shoulder_pan_joint",
-    "shoulder_lift_joint",
-    "elbow_joint",
-    "wrist_1_joint",
-    "wrist_2_joint",
-    "wrist_3_joint",
-)
-"""UR10e arm DoFs in canonical chain order. 2F-85 finger joints are
-tendon-driven and not addressed through `qpos_idx` / `dof_idx`."""
+    qpos_idx: int
+    dof_idx: int
+    scale: float
+    offset: float
 
-_FRANKA_PANDA_ARM_JOINT_SUFFIXES: tuple[str, ...] = tuple(f"joint{i}" for i in range(1, 8))
-"""Franka Panda 7-DoF arm joints. Hand finger joints (`finger_joint1`,
-`finger_joint2`) are tendon-coupled via actuator8 — UR10e-shaped, not
-Piper-shaped — so they're not addressed through `qpos_idx` / `dof_idx`."""
-
-_FRANKA_PANDA_ROBOTIQ_ARM_JOINT_SUFFIXES: tuple[str, ...] = _FRANKA_PANDA_ARM_JOINT_SUFFIXES
-"""Franka Panda arm joints with a Robotiq 2F-85 gripper attached."""
-
-
-ROBOT_ADAPTERS: Mapping[RobotKind, RobotAdapter] = {
-    RobotKind.PIPER: RobotAdapter(
-        robot_kind=RobotKind.PIPER,
-        joint_suffixes=_PIPER_ARM_JOINT_SUFFIXES,
-        controlled_arm_joint_count=6,
-        arm_actuator_suffixes=tuple(f"joint{i}" for i in range(1, 7)),
-        gripper_actuator_suffix="gripper",
-        wrist_body_suffix="link6",
-        tcp_site_suffix="tcp",
-        piper_mirrored_gripper_joint_suffixes=("joint7", "joint8"),
-    ),
-    RobotKind.UR10E: RobotAdapter(
-        robot_kind=RobotKind.UR10E,
-        joint_suffixes=_UR10E_ARM_JOINT_SUFFIXES,
-        controlled_arm_joint_count=6,
-        arm_actuator_suffixes=(
-            "shoulder_pan",
-            "shoulder_lift",
-            "elbow",
-            "wrist_1",
-            "wrist_2",
-            "wrist_3",
-        ),
-        gripper_actuator_suffix="gripper/fingers_actuator",
-        wrist_body_suffix="wrist_3_link",
-        tcp_site_suffix="tcp",
-    ),
-    RobotKind.FRANKA_PANDA: RobotAdapter(
-        robot_kind=RobotKind.FRANKA_PANDA,
-        joint_suffixes=_FRANKA_PANDA_ARM_JOINT_SUFFIXES,
-        controlled_arm_joint_count=7,
-        arm_actuator_suffixes=tuple(f"actuator{i}" for i in range(1, 8)),
-        gripper_actuator_suffix="actuator8",
-        # `hand` is the rigid-body parent of the parallel-jaw fingers; it's
-        # where grasp welds anchor (analogous to UR10e using `wrist_3_link`,
-        # the 2F-85 mount frame, not the kinematic wrist link itself).
-        wrist_body_suffix="hand",
-        tcp_site_suffix="tcp",
-    ),
-    RobotKind.FRANKA_PANDA_ROBOTIQ_2F85: RobotAdapter(
-        robot_kind=RobotKind.FRANKA_PANDA_ROBOTIQ_2F85,
-        joint_suffixes=_FRANKA_PANDA_ROBOTIQ_ARM_JOINT_SUFFIXES,
-        controlled_arm_joint_count=7,
-        arm_actuator_suffixes=tuple(f"actuator{i}" for i in range(1, 8)),
-        gripper_actuator_suffix="gripper/fingers_actuator",
-        wrist_body_suffix="gripper/base",
-        tcp_site_suffix="gripper/pinch",
-    ),
-}
-
-
-def parse_robot_kind(raw_robot_kind: object) -> RobotKind:
-    try:
-        return RobotKind(str(raw_robot_kind))
-    except ValueError as err:
-        valid = ", ".join(robot_kind.value for robot_kind in RobotKind)
-        raise ValueError(
-            f"unsupported robot kind {raw_robot_kind!r}; expected one of: {valid}"
-        ) from err
-
-
-def robot_adapter(robot_kind: RobotKind | str) -> RobotAdapter:
-    parsed_robot_kind = (
-        robot_kind if isinstance(robot_kind, RobotKind) else parse_robot_kind(robot_kind)
-    )
-    return ROBOT_ADAPTERS[parsed_robot_kind]
-
-
-def arm_joint_suffixes(robot_kind: RobotKind | str) -> tuple[str, ...]:
-    """Return canonical-order arm joint suffixes for a robot kind.
-
-    Single source of truth shared by `get_arm_handles`, the runner's
-    rerun scalar logging, and teleop's per-joint slider labels.
-    Callers must NOT redefine this list locally.
-    """
-    return robot_adapter(robot_kind).arm_joint_suffixes
+    def qpos_for_ctrl(self, ctrl: float) -> float:
+        return self.offset + self.scale * ctrl
 
 
 @dataclass
 class ArmHandles:
     side: ArmSide
-    robot_kind: RobotKind
-    # piper=8 (joints 1..8), ur10e=6.
+    name: str
+    joint_names: tuple[str, ...]
+    joint_labels: tuple[str, ...]
     qpos_idx: np.ndarray
     dof_idx: np.ndarray
     jnt_ids: np.ndarray
     arm_dof_idx: np.ndarray
-    # Position-actuator ids for the 6 arm DoFs. The runner mirrors
-    # puppet qpos into ctrl so position servos don't fight back with
-    # stale targets.
     act_arm_ids: np.ndarray
     act_gripper_id: int
-    # Grasp-weld parent. Piper: link6. UR10e: wrist_3_link (the 2F-85
-    # attachment frame).
-    link6_id: int
+    grasp_body_id: int
+    base_body_id: int
     tcp_site_id: int
+    tcp_site_name: str
     gripper_open: float
     gripper_closed: float
-    weld_ids: np.ndarray  # equality ids, one per cube (may be empty)
-    piper_mirrored_gripper_qpos_idx: tuple[int, int] | None = None
-    piper_mirrored_gripper_dof_idx: tuple[int, int] | None = None
+    gripper_puppet_joints: tuple[GripperPuppetJointHandle, ...]
+    weld_ids: np.ndarray
 
     @property
     def arm_qpos_idx(self) -> np.ndarray:
-        """qpos indices for controlled arm DoFs only."""
-        return self.qpos_idx[: len(self.act_arm_ids)]
+        """qpos indices for controlled arm DoFs."""
+        return self.qpos_idx
 
-    @property
-    def tcp_site_name(self) -> str:
-        return f"{self.side}tcp"
+
+def namespaced_name(side: ArmSide, suffix: str) -> str:
+    """Return the dm_control attach namespace name for a single-arm subtree."""
+    return f"{side.value}{suffix}"
+
+
+def _namespaced_tuple(side: ArmSide, suffixes: Iterable[str]) -> tuple[str, ...]:
+    return tuple(namespaced_name(side, suffix) for suffix in suffixes)
+
+
+def _joint_labels(prefix: str, count: int) -> tuple[str, ...]:
+    return tuple(f"{prefix}{joint_index}" for joint_index in range(1, count + 1))
+
+
+def piper_manipulator_spec(side: ArmSide) -> ManipulatorSpec:
+    joint_names = _namespaced_tuple(side, (f"joint{i}" for i in range(1, 7)))
+    return ManipulatorSpec(
+        side=side,
+        name="piper",
+        joint_names=joint_names,
+        arm_actuator_names=joint_names,
+        gripper=GripperControlSpec(
+            actuator_name=namespaced_name(side, "gripper"),
+            open_ctrl=0.035,
+            closed_ctrl=0.0,
+            puppet_joints=(
+                GripperPuppetJoint(namespaced_name(side, "joint7"), scale=1.0),
+                GripperPuppetJoint(namespaced_name(side, "joint8"), scale=-1.0),
+            ),
+        ),
+        wrist_body_name=namespaced_name(side, "link6"),
+        tcp_site_name=namespaced_name(side, "tcp"),
+        base_body_name=namespaced_name(side, "base_link"),
+        joint_labels=_joint_labels("joint", 6),
+    )
+
+
+def ur10e_robotiq_manipulator_spec(side: ArmSide) -> ManipulatorSpec:
+    joint_suffixes = (
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "elbow_joint",
+        "wrist_1_joint",
+        "wrist_2_joint",
+        "wrist_3_joint",
+    )
+    actuator_suffixes = (
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+    )
+    return ManipulatorSpec(
+        side=side,
+        name="ur10e_robotiq_2f85",
+        joint_names=_namespaced_tuple(side, joint_suffixes),
+        arm_actuator_names=_namespaced_tuple(side, actuator_suffixes),
+        gripper=GripperControlSpec(
+            actuator_name=namespaced_name(side, "gripper/fingers_actuator"),
+            open_ctrl=0.0,
+            closed_ctrl=255.0,
+        ),
+        wrist_body_name=namespaced_name(side, "wrist_3_link"),
+        tcp_site_name=namespaced_name(side, "tcp"),
+        base_body_name=namespaced_name(side, "base"),
+        joint_labels=joint_suffixes,
+    )
+
+
+def franka_panda_manipulator_spec(side: ArmSide) -> ManipulatorSpec:
+    joint_suffixes = tuple(f"joint{i}" for i in range(1, 8))
+    return ManipulatorSpec(
+        side=side,
+        name="franka_panda",
+        joint_names=_namespaced_tuple(side, joint_suffixes),
+        arm_actuator_names=_namespaced_tuple(side, (f"actuator{i}" for i in range(1, 8))),
+        gripper=GripperControlSpec(
+            actuator_name=namespaced_name(side, "actuator8"),
+            open_ctrl=255.0,
+            closed_ctrl=0.0,
+        ),
+        wrist_body_name=namespaced_name(side, "hand"),
+        tcp_site_name=namespaced_name(side, "tcp"),
+        base_body_name=namespaced_name(side, "link0"),
+        joint_labels=joint_suffixes,
+    )
+
+
+def franka_panda_robotiq_manipulator_spec(side: ArmSide) -> ManipulatorSpec:
+    joint_suffixes = tuple(f"joint{i}" for i in range(1, 8))
+    return ManipulatorSpec(
+        side=side,
+        name="franka_panda_robotiq_2f85",
+        joint_names=_namespaced_tuple(side, joint_suffixes),
+        arm_actuator_names=_namespaced_tuple(side, (f"actuator{i}" for i in range(1, 8))),
+        gripper=GripperControlSpec(
+            actuator_name=namespaced_name(side, "gripper/fingers_actuator"),
+            open_ctrl=0.0,
+            closed_ctrl=255.0,
+        ),
+        wrist_body_name=namespaced_name(side, "gripper/base"),
+        tcp_site_name=namespaced_name(side, "gripper/pinch"),
+        base_body_name=namespaced_name(side, "link0"),
+        joint_labels=joint_suffixes,
+    )
+
+
+def openarm_v1_manipulator_spec(side: ArmSide) -> ManipulatorSpec:
+    joint_suffixes = tuple(f"openarm_joint{i}" for i in range(1, 8))
+    return ManipulatorSpec(
+        side=side,
+        name="openarm_v1",
+        joint_names=_namespaced_tuple(side, joint_suffixes),
+        arm_actuator_names=_namespaced_tuple(side, (f"joint{i}_ctrl" for i in range(1, 8))),
+        gripper=GripperControlSpec(
+            actuator_name=namespaced_name(side, "finger_ctrl"),
+            open_ctrl=0.044,
+            closed_ctrl=0.0,
+            puppet_joints=(
+                GripperPuppetJoint(namespaced_name(side, "openarm_finger_joint1"), scale=1.0),
+                GripperPuppetJoint(namespaced_name(side, "openarm_finger_joint2"), scale=1.0),
+            ),
+        ),
+        wrist_body_name=namespaced_name(side, "openarm_link7"),
+        tcp_site_name=namespaced_name(side, "tcp"),
+        base_body_name=namespaced_name(side, "openarm_link1"),
+        joint_labels=_joint_labels("openarm_joint", 7),
+    )
+
+
+def openarm_v2_manipulator_spec(side: ArmSide, *, namespace: str = "") -> ManipulatorSpec:
+    def v2_name(name: str) -> str:
+        return f"{namespace}/{name}" if namespace else name
+
+    side_label = side.label
+    finger_open = 0.7854 if side is ArmSide.LEFT else -0.7854
+    return ManipulatorSpec(
+        side=side,
+        name="openarm_v2",
+        joint_names=tuple(v2_name(f"openarm_{side_label}_joint{i}") for i in range(1, 8)),
+        arm_actuator_names=tuple(v2_name(f"{side_label}_joint{i}_ctrl") for i in range(1, 8)),
+        gripper=GripperControlSpec(
+            actuator_name=v2_name(f"{side_label}_finger1_ctrl"),
+            open_ctrl=finger_open,
+            closed_ctrl=0.0,
+            puppet_joints=(
+                GripperPuppetJoint(v2_name(f"openarm_{side_label}_finger_joint1"), scale=1.0),
+                GripperPuppetJoint(v2_name(f"openarm_{side_label}_finger_joint2"), scale=1.0),
+            ),
+        ),
+        wrist_body_name=v2_name(f"openarm_{side_label}_ee_base_link"),
+        tcp_site_name=v2_name(f"openarm_{side_label}_tcp"),
+        base_body_name=v2_name(f"openarm_{side_label}_base_link"),
+        joint_labels=_joint_labels(f"openarm_{side_label}_joint", 7),
+    )
+
+
+def arm_joint_labels(manipulator_or_arm: ManipulatorSpec | ArmHandles) -> tuple[str, ...]:
+    """Return canonical arm joint labels for UI and scalar logging."""
+    return manipulator_or_arm.joint_labels
 
 
 def _resolve_id(model: mujoco.MjModel, obj_type: int, name: str, kind: str) -> int:
-    """Look up an MJCF element id by name; raise with context if missing."""
     obj_id = mujoco.mj_name2id(model, obj_type, name)
     if obj_id < 0:
-        raise RuntimeError(
-            f"{kind} {name!r} not found in compiled model. "
-            "Check the scene module's `ROBOT_KIND` matches the actually-loaded robot."
+        raise RuntimeError(f"{kind} {name!r} not found in compiled model")
+    return int(obj_id)
+
+
+def _resolve_gripper_puppet_joints(
+    model: mujoco.MjModel,
+    specs: tuple[GripperPuppetJoint, ...],
+) -> tuple[GripperPuppetJointHandle, ...]:
+    handles: list[GripperPuppetJointHandle] = []
+    for spec in specs:
+        joint_id = _resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, spec.joint_name, "gripper joint")
+        handles.append(
+            GripperPuppetJointHandle(
+                qpos_idx=int(model.jnt_qposadr[joint_id]),
+                dof_idx=int(model.jnt_dofadr[joint_id]),
+                scale=spec.scale,
+                offset=spec.offset,
+            )
         )
-    return obj_id
-
-
-def _coerce_manipulator_spec(
-    side_or_spec: ArmSide | ManipulatorSpec,
-    robot_kind: RobotKind | str,
-) -> ManipulatorSpec:
-    if isinstance(side_or_spec, ManipulatorSpec):
-        return side_or_spec
-    return ManipulatorSpec(side=side_or_spec, robot_kind=parse_robot_kind(robot_kind))
+    return tuple(handles)
 
 
 def get_arm_handles(
     model: mujoco.MjModel,
-    side: ArmSide | ManipulatorSpec,
+    manipulator: ManipulatorSpec,
     n_cubes: int,
-    robot_kind: RobotKind | str = RobotKind.PIPER,
 ) -> ArmHandles:
-    """Resolve all per-arm handles. The `robot_kind` argument selects
-    which joint-name convention + gripper layout to use. Scenes
-    declare this via a module-level `ROBOT_KIND` attribute that the
-    runner reads with `getattr`."""
-    manipulator_spec = _coerce_manipulator_spec(side, robot_kind)
-    adapter = robot_adapter(manipulator_spec.robot_kind)
-    side = manipulator_spec.side
-
-    jnt_names = [f"{side}{suffix}" for suffix in adapter.joint_suffixes]
-    jnt_ids = np.array(
-        [_resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, n, "joint") for n in jnt_names]
+    """Resolve compiled MuJoCo ids for one explicit manipulator declaration."""
+    joint_ids = np.array(
+        [
+            _resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name, "joint")
+            for joint_name in manipulator.joint_names
+        ],
+        dtype=np.int64,
     )
-    qpos_idx = np.array([model.jnt_qposadr[j] for j in jnt_ids])
-    dof_idx = np.array([model.jnt_dofadr[j] for j in jnt_ids])
-
-    act_arm_names = [f"{side}{suffix}" for suffix in adapter.arm_actuator_suffixes]
-    act_arm_ids = np.array(
-        [_resolve_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n, "actuator") for n in act_arm_names]
+    qpos_idx = np.array([int(model.jnt_qposadr[joint_id]) for joint_id in joint_ids])
+    dof_idx = np.array([int(model.jnt_dofadr[joint_id]) for joint_id in joint_ids])
+    actuator_ids = np.array(
+        [
+            _resolve_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name, "actuator")
+            for actuator_name in manipulator.arm_actuator_names
+        ],
+        dtype=np.int64,
     )
-    act_gripper_id = _resolve_id(
-        model,
-        mujoco.mjtObj.mjOBJ_ACTUATOR,
-        f"{side}{adapter.gripper_actuator_suffix}",
-        "gripper actuator",
-    )
-    link6_id = _resolve_id(
-        model, mujoco.mjtObj.mjOBJ_BODY, f"{side}{adapter.wrist_body_suffix}", "wrist body"
-    )
-    tcp_site_id = _resolve_id(
-        model, mujoco.mjtObj.mjOBJ_SITE, f"{side}{adapter.tcp_site_suffix}", "TCP site"
-    )
-
-    piper_mirrored_gripper_qpos_idx: tuple[int, int] | None = None
-    piper_mirrored_gripper_dof_idx: tuple[int, int] | None = None
-    if adapter.piper_mirrored_gripper_joint_suffixes is not None:
-        # Piper joint7 is a slide (range 0..0.035 m); joint8 mirrors via
-        # tendon. Read the range rather than hardcoding numerics.
-        gripper_jnt_id = _resolve_id(
-            model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}joint7", "Piper joint7"
-        )
-        lo, hi = model.jnt_range[gripper_jnt_id]
-        gripper_open = float(hi)
-        gripper_closed = float(lo)
-        first_gripper_joint_suffix, second_gripper_joint_suffix = (
-            adapter.piper_mirrored_gripper_joint_suffixes
-        )
-        mirrored_joint_ids = (
-            _resolve_id(model, mujoco.mjtObj.mjOBJ_JOINT, f"{side}{suffix}", "Piper gripper joint")
-            for suffix in (first_gripper_joint_suffix, second_gripper_joint_suffix)
-        )
-        first_gripper_joint_id, second_gripper_joint_id = mirrored_joint_ids
-        piper_mirrored_gripper_qpos_idx = (
-            int(model.jnt_qposadr[first_gripper_joint_id]),
-            int(model.jnt_qposadr[second_gripper_joint_id]),
-        )
-        piper_mirrored_gripper_dof_idx = (
-            int(model.jnt_dofadr[first_gripper_joint_id]),
-            int(model.jnt_dofadr[second_gripper_joint_id]),
-        )
-    elif adapter.robot_kind is RobotKind.FRANKA_PANDA:
-        # Menagerie's stock Panda hand remaps the original 0..0.04 m
-        # finger-position actuator to a 0..255 ctrlrange. 255 is open
-        # (0.04 m), 0 is closed.
-        gripper_open = 255.0
-        gripper_closed = 0.0
-    else:
-        # Robotiq 2F-85 ctrlrange: 0 fully open, 255 fully closed.
-        gripper_open = 0.0
-        gripper_closed = 255.0
-
     weld_ids = np.array(
         [
             mujoco.mj_name2id(
                 model,
                 mujoco.mjtObj.mjOBJ_EQUALITY,
-                f"{side.replace('/', '_')}grasp_cube{i}",
+                f"{manipulator.side.value.replace('/', '_')}grasp_cube{i}",
             )
             for i in range(n_cubes)
         ],
         dtype=np.int64,
     )
-
     return ArmHandles(
-        side=side,
-        robot_kind=adapter.robot_kind,
+        side=manipulator.side,
+        name=manipulator.name,
+        joint_names=manipulator.joint_names,
+        joint_labels=manipulator.resolved_joint_labels,
         qpos_idx=qpos_idx,
         dof_idx=dof_idx,
-        jnt_ids=jnt_ids,
-        arm_dof_idx=dof_idx[: adapter.controlled_arm_joint_count],
-        act_arm_ids=act_arm_ids,
-        act_gripper_id=act_gripper_id,
-        link6_id=link6_id,
-        tcp_site_id=tcp_site_id,
-        gripper_open=gripper_open,
-        gripper_closed=gripper_closed,
+        jnt_ids=joint_ids,
+        arm_dof_idx=dof_idx,
+        act_arm_ids=actuator_ids,
+        act_gripper_id=_resolve_id(
+            model,
+            mujoco.mjtObj.mjOBJ_ACTUATOR,
+            manipulator.gripper.actuator_name,
+            "gripper actuator",
+        ),
+        grasp_body_id=_resolve_id(
+            model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            manipulator.wrist_body_name,
+            "grasp body",
+        ),
+        base_body_id=_resolve_id(
+            model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            manipulator.base_body_name,
+            "base body",
+        ),
+        tcp_site_id=_resolve_id(
+            model,
+            mujoco.mjtObj.mjOBJ_SITE,
+            manipulator.tcp_site_name,
+            "TCP site",
+        ),
+        tcp_site_name=manipulator.tcp_site_name,
+        gripper_open=manipulator.gripper.open_ctrl,
+        gripper_closed=manipulator.gripper.closed_ctrl,
+        gripper_puppet_joints=_resolve_gripper_puppet_joints(
+            model, manipulator.gripper.puppet_joints
+        ),
         weld_ids=weld_ids,
-        piper_mirrored_gripper_qpos_idx=piper_mirrored_gripper_qpos_idx,
-        piper_mirrored_gripper_dof_idx=piper_mirrored_gripper_dof_idx,
     )
 
 
-def manipulator_specs_from_legacy_arm_sides(
-    arm_sides: Sequence[ArmSide],
-    robot_kind: RobotKind,
-) -> tuple[ManipulatorSpec, ...]:
-    return tuple(ManipulatorSpec(side=side, robot_kind=robot_kind) for side in arm_sides)
+def write_gripper_target(data: mujoco.MjData, arm: ArmHandles, target_ctrl: float) -> None:
+    """Write gripper actuator ctrl and any declared puppet-joint qpos."""
+    for puppet_joint in arm.gripper_puppet_joints:
+        data.qpos[puppet_joint.qpos_idx] = puppet_joint.qpos_for_ctrl(target_ctrl)
+        data.qvel[puppet_joint.dof_idx] = 0.0
+    data.ctrl[arm.act_gripper_id] = target_ctrl

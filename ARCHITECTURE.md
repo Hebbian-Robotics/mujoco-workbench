@@ -61,15 +61,14 @@ contract:
 ```python
 import mujoco
 
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, ManipulatorSpec, RobotKind
+from mujoco_workbench.arm_handles import ArmHandles, ArmSide, piper_manipulator_spec
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.scene_base import Step
 
 NAME = "my_scene"
-ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
 MANIPULATORS = (
-    ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.PIPER),
-    ManipulatorSpec(side=ArmSide.RIGHT, robot_kind=RobotKind.PIPER),
+    piper_manipulator_spec(ArmSide.LEFT),
+    piper_manipulator_spec(ArmSide.RIGHT),
 )
 N_CUBES = 0
 
@@ -102,12 +101,12 @@ def make_task_plan(
 Alternatively, export `step_free_play(t, model, data)` instead of
 `make_task_plan` for a non-scripted scene.
 
-`ARM_PREFIXES` plus scene-global `ROBOT_KIND` is still accepted for bundled
-legacy scenes. New scenes should prefer `MANIPULATORS`, which is parsed into
-per-arm robot adapters at the runtime boundary. The supported topology remains
-deliberately narrow: one or two manipulators, with optional mobile-base
-actuators declared via `BASE_ACTUATOR_NAMES` and an optional vertical lift or
-torso actuator declared via `LIFT_ACTUATOR_NAME`.
+`MANIPULATORS` is required and carries explicit compiled MJCF names for joints,
+actuators, gripper controls, TCP sites, and base bodies. `ArmSide` is only the
+logical task-plan key; runtime code does not derive MuJoCo names from it. The
+supported topology remains deliberately narrow: one or two manipulators, with
+optional mobile-base actuators declared via `BASE_ACTUATOR_NAMES` and an
+optional vertical lift or torso actuator declared via `LIFT_ACTUATOR_NAME`.
 
 `Step` is the timeline boundary. It carries target arm joints, gripper state,
 planar base targets, lift targets, remaining auxiliary actuator targets, visual
@@ -121,6 +120,25 @@ drives the `(x, y, yaw)` actuator tuple declared by `BASE_ACTUATOR_NAMES`;
 `Step.lift_target` drives the actuator declared by `LIFT_ACTUATOR_NAME`; and
 `Step.aux_ctrl` is reserved for remaining scene-specific actuators that are not
 part of the arm, planar base, or lift.
+
+## Embodiment Porting
+
+Embodiment-specific naming is scene-owned data, not runtime branching. Robot
+helper modules may expose constructors such as `piper_manipulator_spec()` or
+`openarm_v2_manipulator_spec()`, but those constructors return the same explicit
+`ManipulatorSpec` shape consumed by the runner.
+
+Grippers are declarative through `GripperControlSpec`: every manipulator names
+its actuator, open/closed control values, and any puppet-written finger joints.
+This covers Piper mirrored slide joints, Robotiq actuator-only grippers, and
+OpenArm v2's asymmetric left/right finger ranges without robot-kind checks.
+
+Native bimanual MJCFs are supported by attaching the whole arm assembly once
+onto an embodiment-specific body and declaring each logical arm with explicit
+native names. OpenArm v2 uses this path: the scene starts from the OpenArm
+pedestal body, attaches the bimanual MJCF at its native mount, and the compiled
+arm names keep the `openarm_v2/...` attach namespace while the left and right
+specs point at `openarm_left_*` / `openarm_right_*` internals.
 
 ## Architectural Invariants
 

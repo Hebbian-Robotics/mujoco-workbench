@@ -3,9 +3,8 @@
 Every scene module is expected to expose, at module level:
 
     NAME: str                       # display name used in the Viser GUI
-    ARM_PREFIXES: tuple[str, ...]   # legacy left/right arm prefixes
-    # New scenes may prefer MANIPULATORS: tuple[ManipulatorSpec, ...] for
-    # per-arm robot-kind declarations.
+    MANIPULATORS: tuple[ManipulatorSpec, ...]
+        Explicit per-manipulator compiled MJCF names and gripper conventions.
     N_CUBES: int                    # number of grippable objects (0 if no grasp)
 
     def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
@@ -53,6 +52,11 @@ Scripted scenes may also expose:
         Optional vertical lift or torso actuator name. Scenes drive it through
         Step.lift_target rather than Step.aux_ctrl.
 
+    DEFAULT_VISER_CAMERA_POSE: ViserCameraPose
+        Optional browser viewer startup camera pose. This is only for the
+        interactive Viser orbit camera; it does not affect simulated cameras
+        or offline renders.
+
 The runner introspects the module, so these optional declarations can be absent.
 """
 
@@ -73,6 +77,14 @@ QuatWxyz = Float[np.ndarray, "4"]
 JointConfig = Float[np.ndarray, "6"]
 
 GripperState = Literal["open", "closed"]
+
+
+@dataclass(frozen=True)
+class ViserCameraPose:
+    """Startup pose for the interactive Viser orbit camera."""
+
+    position: tuple[float, float, float]
+    lookat: tuple[float, float, float]
 
 
 class TaskPhase(StrEnum):

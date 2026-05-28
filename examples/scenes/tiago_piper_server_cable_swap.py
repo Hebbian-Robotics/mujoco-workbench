@@ -53,7 +53,13 @@ from examples.paths import D405_MESH_STL, D435I_XML
 from examples.robots.piper import load_piper
 from examples.robots.tiago import load_tiago
 from examples.scenes.tiago_piper_server_cable_swap_layout import HOME_ARM_Q, IK_SEED_Q, LAYOUT
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    ManipulatorSpec,
+    piper_manipulator_spec,
+    write_gripper_target,
+)
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.ik import PositionOnly, solve_ik
 from mujoco_workbench.placement import camera_xyaxes_for_look_at, standoff_position
@@ -76,16 +82,14 @@ from mujoco_workbench.scene_check import (
 from mujoco_workbench.welds import activate_attachment_weld
 
 NAME = "tiago_piper_server_cable_swap"
-# `ROBOT_KIND` is read by the runner/runtime to pick the
-# right `arm_handles.get_arm_handles` branch + per-tick gripper-write
-# convention. The legacy TIAGo+Piper scene stays on the original
-# Piper 8-joint qpos layout.
-ROBOT_KIND = "piper"
 # Joints the IK solver must lock — TIAGo's torso lift is non-arm and moves as a
 # timeline lift component; locking it lets mink optimise only the 6-DOF Piper
 # arm chain.
 IK_LOCKED_JOINT_NAMES: tuple[str, ...] = ("torso_lift_joint",)
-ARM_PREFIXES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+ARM_SIDES: tuple[ArmSide, ...] = (ArmSide.LEFT, ArmSide.RIGHT)
+MANIPULATORS: tuple[ManipulatorSpec, ...] = tuple(
+    piper_manipulator_spec(side) for side in ARM_SIDES
+)
 RACK_HANDLE_APPROACH_M = 0.07
 RACK_HANDLE_PULL_CLEAR_M = 0.40
 CART_HANDLE_LIFT_CLEARANCE_M = 0.10
@@ -1051,7 +1055,7 @@ def build_spec() -> tuple[mujoco.MjModel, mujoco.MjData]:
     # must match `grasp_weld(side, i)` — `get_arm_handles` looks them up
     # via the same `<side>_grasp_cube<i>` formula. The body lookups
     # use slash-namespaced piper bodies (`left/link6`).
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         hand = f"{side}link6"
         side_us = side.replace("/", "_")
         for i, obj_name in enumerate(GRIPPABLES):
@@ -1129,9 +1133,7 @@ class _SceneIds:
     server_body_id: int
     new_server_body_id: int
     rack_body_id: int
-    # The moving TIAGo body the bins hang off (renamed from `carriage_body_id`
-    # now that the mobile embodiment is TIAGo rather than our hand-built
-    # `lift_carriage`).
+    # The moving TIAGo torso body used as the lift frame.
     torso_body_id: int
     cable_connector_body_ids: list[int]
     # Attachment welds by enum member — derived from ATTACHMENTS, so it always
@@ -1180,10 +1182,8 @@ def apply_initial_state(
         # reference pose where the two finger plates sit together as a
         # wedge. The arms open the gripper just before reaching for a
         # cable/handle (see the "approach" steps in `make_task_plan`).
-        data.qpos[arm.qpos_idx[6]] = arm.gripper_closed
-        data.qpos[arm.qpos_idx[7]] = -arm.gripper_closed
         data.ctrl[arm.act_arm_ids] = HOME_ARM_Q
-        data.ctrl[arm.act_gripper_id] = arm.gripper_closed
+        write_gripper_target(data, arm, arm.gripper_closed)
         # All grasp welds start inactive.
         for eq_id in arm.weld_ids:
             data.eq_active[eq_id] = 0
@@ -1303,12 +1303,6 @@ def _snap_factory(
     return snap
 
 
-def _port_world_pos(port_idx: int) -> Position3:
-    """World position of port geom `port_idx` on the rack-mounted server.
-    Thin wrapper around `LAYOUT.port_world_pos` kept for legacy call sites."""
-    return LAYOUT.port_world_pos(port_idx)
-
-
 def _torso_world_z(lift_qpos: float) -> float:
     """World z of torso_lift_link at a given lift qpos. Mirrors TIAGo's
     upstream `<body name="torso_lift_link" pos="-0.062 0 0.8885">` plus the
@@ -1341,7 +1335,7 @@ def make_task_plan(
       * Cable replug — "seat in port" step activates port-new weld; the
         following step releases the grasp.
     """
-    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_PREFIXES}
+    scripts: dict[ArmSide, list[Step]] = {side: [] for side in ARM_SIDES}
     lift_jnt = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, DataCenterLiftActuator.LIFT)
 
     def push_both(
@@ -1350,7 +1344,7 @@ def make_task_plan(
         target: BaseAndLiftTarget | None = None,
         gripper: GripperState = "closed",
     ) -> None:
-        for side in ARM_PREFIXES:
+        for side in ARM_SIDES:
             scripts[side].append(
                 Step(
                     label=label,
@@ -2132,7 +2126,7 @@ def make_task_plan(
         # After unplug, cable was released at "pulled" pose = port - 14 cm
         # in x, +3 cm in z. That's where the cable sits now (gravity=0,
         # nothing's moved it). Replug grip aims for that same spot.
-        port_pos = _port_world_pos(port_idx)
+        port_pos = LAYOUT.port_world_pos(port_idx)
         # Regrip aligns with the unplug "pulled" position (4 cm forward
         # of port + 2 cm up) — that's where the connector dangles after
         # release. Approach + seated stay close so the rigid rod can
@@ -2206,7 +2200,7 @@ def make_task_plan(
     # 5) Return home
     push_both("return home", 1.6, target=target_home)
 
-    for side in ARM_PREFIXES:
+    for side in ARM_SIDES:
         print(f"  [{side}] {len(scripts[side])} steps planned")
 
     apply_initial_state(model, data, arms, cube_body_ids)

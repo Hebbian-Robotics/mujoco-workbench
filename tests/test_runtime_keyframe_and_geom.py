@@ -11,6 +11,14 @@ from __future__ import annotations
 import mujoco
 import pytest
 
+from mujoco_workbench.arm_handles import (
+    ArmSide,
+    GripperControlSpec,
+    GripperPuppetJoint,
+    ManipulatorSpec,
+    get_arm_handles,
+    write_gripper_target,
+)
 from mujoco_workbench.runtime import (
     apply_keyframe,
     disable_geom_collision,
@@ -42,11 +50,56 @@ _KEYFRAME_XML = """
 </mujoco>
 """
 
+_EXPLICIT_MANIPULATOR_XML = """
+<mujoco model="explicit_test">
+  <worldbody>
+    <body name="robot_base">
+      <joint name="arm_joint1" type="hinge" range="-1 1"/>
+      <geom type="sphere" size="0.01"/>
+      <body name="robot_wrist">
+        <joint name="arm_joint2" type="hinge" range="-1 1"/>
+        <joint name="finger_left" type="slide" range="-1 1"/>
+        <joint name="finger_right" type="slide" range="-1 1"/>
+        <geom type="sphere" size="0.01"/>
+        <site name="robot_tcp" size="0.01"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="arm_ctrl1" joint="arm_joint1"/>
+    <position name="arm_ctrl2" joint="arm_joint2"/>
+    <position name="gripper_ctrl" joint="finger_left"/>
+  </actuator>
+</mujoco>
+"""
+
 
 def _load_keyframe_model() -> tuple[mujoco.MjModel, mujoco.MjData]:
     model = mujoco.MjModel.from_xml_string(_KEYFRAME_XML)
     data = mujoco.MjData(model)
     return model, data
+
+
+def _explicit_manipulator_spec() -> ManipulatorSpec:
+    return ManipulatorSpec(
+        side=ArmSide.LEFT,
+        name="explicit_test_arm",
+        joint_names=("arm_joint1", "arm_joint2"),
+        arm_actuator_names=("arm_ctrl1", "arm_ctrl2"),
+        gripper=GripperControlSpec(
+            actuator_name="gripper_ctrl",
+            open_ctrl=0.5,
+            closed_ctrl=0.0,
+            puppet_joints=(
+                GripperPuppetJoint("finger_left", scale=1.0),
+                GripperPuppetJoint("finger_right", scale=-1.0),
+            ),
+        ),
+        wrist_body_name="robot_wrist",
+        tcp_site_name="robot_tcp",
+        base_body_name="robot_base",
+        joint_labels=("shoulder", "elbow"),
+    )
 
 
 def test_sync_position_actuators_to_qpos_copies_each_actuated_joint() -> None:
@@ -56,6 +109,24 @@ def test_sync_position_actuators_to_qpos_copies_each_actuated_joint() -> None:
     sync_position_actuators_to_qpos(model, data)
     assert data.ctrl[0] == pytest.approx(0.25)
     assert data.ctrl[1] == pytest.approx(-0.5)
+
+
+def test_explicit_manipulator_names_resolve_without_side_prefix() -> None:
+    model = mujoco.MjModel.from_xml_string(_EXPLICIT_MANIPULATOR_XML)
+    arm = get_arm_handles(model, _explicit_manipulator_spec(), n_cubes=0)
+    assert arm.joint_names == ("arm_joint1", "arm_joint2")
+    assert arm.joint_labels == ("shoulder", "elbow")
+    assert arm.tcp_site_name == "robot_tcp"
+
+
+def test_write_gripper_target_applies_declared_puppet_joints() -> None:
+    model = mujoco.MjModel.from_xml_string(_EXPLICIT_MANIPULATOR_XML)
+    data = mujoco.MjData(model)
+    arm = get_arm_handles(model, _explicit_manipulator_spec(), n_cubes=0)
+    write_gripper_target(data, arm, 0.4)
+    assert data.ctrl[arm.act_gripper_id] == pytest.approx(0.4)
+    assert data.qpos[arm.gripper_puppet_joints[0].qpos_idx] == pytest.approx(0.4)
+    assert data.qpos[arm.gripper_puppet_joints[1].qpos_idx] == pytest.approx(-0.4)
 
 
 def test_apply_keyframe_resets_qpos_and_syncs_ctrl() -> None:

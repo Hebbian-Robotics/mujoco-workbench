@@ -61,6 +61,10 @@ def run(
         int,
         typer.Option(help="Include named-camera frames every N render ticks; 0 disables."),
     ] = 0,
+    camera_feed_every: Annotated[
+        int,
+        typer.Option(help="Refresh in-browser camera feeds every N render ticks; 0 disables."),
+    ] = 3,
     policy_host: Annotated[
         str | None,
         typer.Option(help="Hosted OpenPI policy server host. Enables policy free-play mode."),
@@ -98,6 +102,8 @@ def run(
         str(render_hz),
         "--rerun-camera-every",
         str(rerun_camera_every),
+        "--camera-feed-every",
+        str(camera_feed_every),
     ]
     if max_rate:
         argv.append("--max-rate")

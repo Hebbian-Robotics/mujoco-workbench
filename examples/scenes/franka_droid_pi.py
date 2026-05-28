@@ -37,7 +37,12 @@ from examples.robots.franka_panda import (
     ROBOTIQ_GRIPPER_BASE_BODY_NAME,
     load_franka_panda_with_robotiq_2f85,
 )
-from mujoco_workbench.arm_handles import ArmHandles, ArmSide, ManipulatorSpec, RobotKind
+from mujoco_workbench.arm_handles import (
+    ArmHandles,
+    ArmSide,
+    ManipulatorSpec,
+    franka_panda_robotiq_manipulator_spec,
+)
 from mujoco_workbench.cameras import CameraRole
 from mujoco_workbench.embodiments.droid import (
     DROID_CONTROL_PERIOD_SECONDS,
@@ -89,10 +94,7 @@ _RED_CAN_TARGET = _CanTargetSpec(
 # Scene-module public attributes (introspected by `runtime.load_scene`).
 # ---------------------------------------------------------------------------
 NAME = "Franka DROID (pi05)"
-ROBOT_KIND = RobotKind.FRANKA_PANDA_ROBOTIQ_2F85
-MANIPULATORS: tuple[ManipulatorSpec, ...] = (
-    ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.FRANKA_PANDA_ROBOTIQ_2F85),
-)
+MANIPULATORS: tuple[ManipulatorSpec, ...] = (franka_panda_robotiq_manipulator_spec(ArmSide.LEFT),)
 # Legacy name used by shared ArmHandles/grasp-weld indexing; this is the
 # number of grippable targets, not necessarily literal cubes.
 N_CUBES = 1

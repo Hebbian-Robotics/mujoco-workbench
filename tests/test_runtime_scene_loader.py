@@ -7,8 +7,14 @@ from types import ModuleType
 
 import pytest
 
-from mujoco_workbench.arm_handles import ArmSide, ManipulatorSpec, RobotKind
+from mujoco_workbench.arm_handles import (
+    ArmSide,
+    franka_panda_manipulator_spec,
+    piper_manipulator_spec,
+    ur10e_robotiq_manipulator_spec,
+)
 from mujoco_workbench.runtime import load_scene
+from mujoco_workbench.scene_base import ViserCameraPose
 
 
 def _install_scene_module(module_name: str, **attrs: object) -> None:
@@ -32,8 +38,10 @@ def test_load_scene_parses_finite_scene_metadata() -> None:
     _install_scene_module(
         module_name,
         NAME="Fake scene",
-        ARM_PREFIXES=("left/", "right/"),
-        ROBOT_KIND="ur10e",
+        MANIPULATORS=(
+            ur10e_robotiq_manipulator_spec(ArmSide.LEFT),
+            ur10e_robotiq_manipulator_spec(ArmSide.RIGHT),
+        ),
         GRIPPABLES=("server",),
         BASE_ACTUATOR_NAMES=("base_x", "base_y", "base_yaw"),
         LIFT_ACTUATOR_NAME="torso_lift",
@@ -44,11 +52,10 @@ def test_load_scene_parses_finite_scene_metadata() -> None:
 
     assert loaded_scene.display_name == "Fake scene"
     assert loaded_scene.manipulators == (
-        ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.UR10E),
-        ManipulatorSpec(side=ArmSide.RIGHT, robot_kind=RobotKind.UR10E),
+        ur10e_robotiq_manipulator_spec(ArmSide.LEFT),
+        ur10e_robotiq_manipulator_spec(ArmSide.RIGHT),
     )
     assert loaded_scene.arm_sides == (ArmSide.LEFT, ArmSide.RIGHT)
-    assert loaded_scene.robot_kind == RobotKind.UR10E
     assert loaded_scene.grippable_names == ("server",)
     assert loaded_scene.aux_actuator_names == ("indicator_light",)
     assert loaded_scene.mobile_base is not None
@@ -57,13 +64,13 @@ def test_load_scene_parses_finite_scene_metadata() -> None:
     assert loaded_scene.lift.actuator_name == "torso_lift"
 
 
-def test_load_scene_accepts_per_manipulator_robot_kinds() -> None:
-    module_name = "tests._fake_per_manipulator_scene"
+def test_load_scene_accepts_explicit_per_manipulator_specs() -> None:
+    module_name = "tests._fake_explicit_manipulator_scene"
     _install_scene_module(
         module_name,
         MANIPULATORS=(
-            {"side": "left/", "robot_kind": "piper"},
-            {"side": "right/", "robot_kind": "ur10e"},
+            piper_manipulator_spec(ArmSide.LEFT),
+            ur10e_robotiq_manipulator_spec(ArmSide.RIGHT),
         ),
         BASE_ACTUATOR_NAMES=("drive_x", "drive_y", "drive_yaw"),
         LIFT_ACTUATOR_NAME="lift",
@@ -73,8 +80,8 @@ def test_load_scene_accepts_per_manipulator_robot_kinds() -> None:
     loaded_scene = load_scene(module_name)
 
     assert loaded_scene.manipulators == (
-        ManipulatorSpec(side=ArmSide.LEFT, robot_kind=RobotKind.PIPER),
-        ManipulatorSpec(side=ArmSide.RIGHT, robot_kind=RobotKind.UR10E),
+        piper_manipulator_spec(ArmSide.LEFT),
+        ur10e_robotiq_manipulator_spec(ArmSide.RIGHT),
     )
     assert loaded_scene.mobile_base is not None
     assert loaded_scene.mobile_base.actuator_names == ("drive_x", "drive_y", "drive_yaw")
@@ -91,7 +98,7 @@ def test_load_scene_parses_policy_free_play_factory() -> None:
 
     _install_scene_module(
         module_name,
-        MANIPULATORS=({"side": "left/", "robot_kind": "franka_panda"},),
+        MANIPULATORS=(franka_panda_manipulator_spec(ArmSide.LEFT),),
         make_step_free_play=make_step_free_play,
     )
 
@@ -108,6 +115,7 @@ def test_load_scene_parses_camera_feed_preprocessing() -> None:
 
     _install_scene_module(
         module_name,
+        MANIPULATORS=(piper_manipulator_spec(ArmSide.LEFT),),
         CAMERA_FEED_RENDER_WIDTH=320,
         CAMERA_FEED_RENDER_HEIGHT=180,
         preprocess_camera_feed=preprocess_camera_feed,
@@ -120,11 +128,36 @@ def test_load_scene_parses_camera_feed_preprocessing() -> None:
     assert loaded_scene.camera_feed.preprocess is preprocess_camera_feed
 
 
+def test_load_scene_parses_default_viser_camera_pose() -> None:
+    module_name = "tests._fake_default_viser_camera_scene"
+    pose = ViserCameraPose(
+        position=(0.274, -1.800, 1.795),
+        lookat=(1.477, -0.625, 0.977),
+    )
+    _install_scene_module(
+        module_name,
+        MANIPULATORS=(piper_manipulator_spec(ArmSide.LEFT),),
+        DEFAULT_VISER_CAMERA_POSE=pose,
+    )
+
+    loaded_scene = load_scene(module_name)
+
+    assert loaded_scene.default_viser_camera_pose == pose
+
+
+def test_load_scene_rejects_missing_manipulators() -> None:
+    module_name = "tests._fake_missing_manipulators_scene"
+    _install_scene_module(module_name)
+
+    with pytest.raises(ValueError, match="must declare MANIPULATORS"):
+        load_scene(module_name)
+
+
 def test_load_scene_does_not_infer_base_from_aux_actuators() -> None:
     module_name = "tests._fake_aux_only_scene"
     _install_scene_module(
         module_name,
-        MANIPULATORS=({"side": "left/", "robot_kind": "piper"},),
+        MANIPULATORS=(piper_manipulator_spec(ArmSide.LEFT),),
         AUX_ACTUATOR_NAMES=("base_x", "base_y", "base_yaw"),
     )
 
@@ -138,7 +171,7 @@ def test_load_scene_rejects_component_actuators_in_aux_actuators() -> None:
     module_name = "tests._fake_duplicate_component_actuator_scene"
     _install_scene_module(
         module_name,
-        MANIPULATORS=({"side": "left/", "robot_kind": "piper"},),
+        MANIPULATORS=(piper_manipulator_spec(ArmSide.LEFT),),
         BASE_ACTUATOR_NAMES=("base_x", "base_y", "base_yaw"),
         LIFT_ACTUATOR_NAME="lift",
         AUX_ACTUATOR_NAMES=("lift",),
@@ -148,30 +181,14 @@ def test_load_scene_rejects_component_actuators_in_aux_actuators() -> None:
         load_scene(module_name)
 
 
-def test_load_scene_rejects_unknown_robot_kind() -> None:
-    module_name = "tests._fake_bad_robot_kind_scene"
-    _install_scene_module(module_name, ROBOT_KIND="quadruped")
-
-    with pytest.raises(ValueError, match="unsupported ROBOT_KIND"):
-        load_scene(module_name)
-
-
-def test_load_scene_rejects_unknown_arm_side() -> None:
-    module_name = "tests._fake_bad_arm_side_scene"
-    _install_scene_module(module_name, ARM_PREFIXES=("middle/",))
-
-    with pytest.raises(ValueError, match="unsupported ARM_PREFIXES"):
-        load_scene(module_name)
-
-
 def test_load_scene_rejects_more_than_two_manipulators() -> None:
     module_name = "tests._fake_too_many_manipulators_scene"
     _install_scene_module(
         module_name,
         MANIPULATORS=(
-            {"side": "left/", "robot_kind": "piper"},
-            {"side": "right/", "robot_kind": "piper"},
-            {"side": "left/", "robot_kind": "ur10e"},
+            piper_manipulator_spec(ArmSide.LEFT),
+            piper_manipulator_spec(ArmSide.RIGHT),
+            ur10e_robotiq_manipulator_spec(ArmSide.LEFT),
         ),
     )
 

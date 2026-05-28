@@ -81,6 +81,8 @@ Useful `mwb run` flags:
 - `--host`, `--port`: Viser bind address. Defaults to `127.0.0.1:8080`.
 - `--speed`: multiplier on scripted step durations.
 - `--render-hz`: Viser and physics update cap. Defaults to `45`.
+- `--camera-feed-every`: refresh in-browser camera feeds every N render ticks;
+  use `0` to disable feed thumbnails for smoother playback in mesh-heavy scenes.
 - `--max-rate`: run as fast as MuJoCo can step.
 - `--inspect`: compile the scene, run structural checks, print a schematic, and exit.
 - `--strict`: stop on the first phase-contract failure.
@@ -182,6 +184,10 @@ Current limitations:
   with two Piper arms inspecting a rack indicator, including top and wrist
   camera views for headless multi-camera video export. This is the primary
   example used throughout the README.
+- `examples.scenes.openarm_v2_indicator_check`: the same rack indicator task
+  using OpenArm v2's pedestal body and native bimanual arms from an external
+  `openarm_mujoco` checkout. Set `OPENARM_MUJOCO_PATH` if the checkout is not at
+  `../../openarm/openarm_mujoco` relative to this workspace.
 - `examples.scenes.mobile_aloha_ur10e_server_swap`: Mobile ALOHA-style base with
   two UR10e arms and Robotiq 2F-85 grippers performing a server swap.
 - `examples.scenes.tiago_piper_server_cable_swap`: older TIAGo/Piper
@@ -401,6 +407,7 @@ For scene changes, also run at least:
 
 ```bash
 uv run mwb run examples.scenes.mobile_aloha_piper_indicator_check --inspect
+uv run mwb run examples.scenes.openarm_v2_indicator_check --inspect
 uv run mwb debug contracts \
   --scene examples.scenes.mobile_aloha_piper_indicator_check \
   --out-root results/runs
